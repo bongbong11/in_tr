@@ -56,8 +56,8 @@ function isTranslatorPrompt(prompt) {
 function normalizeContextOption() {
     const select = document.querySelector('#itr_context_turns');
     const offOption = select?.querySelector('option[value="0"]');
-    if (offOption && offOption.textContent !== '참고 안 함') {
-        offOption.textContent = '참고 안 함';
+    if (offOption && offOption.textContent !== '0개 선택 · 참고 안 함') {
+        offOption.textContent = '0개 선택 · 참고 안 함';
     }
 }
 
