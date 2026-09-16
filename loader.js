@@ -153,10 +153,10 @@ async function mapWithConcurrency(items, limit, worker) {
     return results;
 }
 
-function withFastReasoning(overridePayload) {
-    const override = { ...(overridePayload ?? {}) };
-    if (override.include_reasoning === false) override.reasoning_effort = 'min';
-    return override;
+function getCompatibleOverride(overridePayload) {
+    // Do not force reasoning_effort here. Custom/OpenAI-compatible endpoints may reject values
+    // such as `min` even when SillyTavern itself supports that enum.
+    return { ...(overridePayload ?? {}) };
 }
 
 function extractContent(response) {
@@ -167,7 +167,7 @@ function extractContent(response) {
 
 async function fastTranslationRequest(profileId, prompt, maxTokens, custom, overridePayload) {
     const source = getSourceFromPrompt(prompt);
-    const fastOverride = withFastReasoning(overridePayload);
+    const compatibleOverride = getCompatibleOverride(overridePayload);
 
     if (!source || source.length <= CHUNK_TRIGGER_CHARS) {
         return originalSendRequest(
@@ -175,7 +175,7 @@ async function fastTranslationRequest(profileId, prompt, maxTokens, custom, over
             prompt,
             Math.min(maxTokens, getFastMaxTokens(source)),
             custom,
-            fastOverride,
+            compatibleOverride,
         );
     }
 
@@ -187,7 +187,7 @@ async function fastTranslationRequest(profileId, prompt, maxTokens, custom, over
             chunkPrompt,
             Math.min(maxTokens, getFastMaxTokens(chunk.text)),
             custom,
-            fastOverride,
+            compatibleOverride,
         );
     });
 
