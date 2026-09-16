@@ -4,10 +4,10 @@
   "requires": [],
   "optional": [],
   "dependencies": [],
-  "js": "loader.js",
+  "js": "guard.js",
   "css": "style.css",
   "author": "bongbong11",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "homePage": "https://github.com/bongbong11/in_tr",
   "auto_update": true
 }
