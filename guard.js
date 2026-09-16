@@ -304,15 +304,26 @@ function findComposerAnchor(rightSendForm, button) {
         element.matches('.fa-film, .fa-keyboard, .fa-clapperboard, [class*="film"], [class*="keyboard"]') ||
         /film|keyboard|필름|키보드/i.test(`${element.id} ${element.className} ${element.getAttribute('title') ?? ''}`),
     );
-    if (likelyFilmControl) return (composerAnchor = likelyFilmControl);
 
-    const sendButton = rightSendForm.querySelector('#send_but');
-    if (sendButton && isVisibleControl(sendButton)) {
-        const sendIndex = candidates.indexOf(sendButton);
-        if (sendIndex > 0) return (composerAnchor = candidates[sendIndex - 1]);
+    let baseAnchor = likelyFilmControl;
+    if (!baseAnchor) {
+        const sendButton = rightSendForm.querySelector('#send_but');
+        if (sendButton && isVisibleControl(sendButton)) {
+            const sendIndex = candidates.indexOf(sendButton);
+            if (sendIndex > 0) baseAnchor = candidates[sendIndex - 1];
+        }
+        baseAnchor ??= sendButton || rightSendForm.lastElementChild;
     }
 
-    return (composerAnchor = sendButton || rightSendForm.lastElementChild);
+    // The previous build placed the globe immediately before baseAnchor.
+    // Move it exactly one additional visible control slot to the left.
+    const baseIndex = candidates.indexOf(baseAnchor);
+    if (baseIndex > 0) {
+        composerAnchor = candidates[baseIndex - 1];
+    } else {
+        composerAnchor = baseAnchor;
+    }
+    return composerAnchor;
 }
 
 function stabilizeTranslateButton() {
