@@ -89,5 +89,38 @@ function scheduleTokenUi(event) {
 }
 
 document.addEventListener('click', scheduleTokenUi, true);
+
+// index.js focuses #send_textarea after inserting a translation. On touch
+// devices that reopens the software keyboard even though the user only tapped
+// the translate button. Suppress only that one programmatic focus: the
+// synthetic input event is emitted while the translate button is busy, then
+// focus() follows immediately in the same call stack. Real user taps/typing are
+// untouched.
+let suppressTranslatedComposerFocus = false;
+
+function isTouchComposerDevice() {
+    return Boolean(window.matchMedia?.('(pointer: coarse)')?.matches || navigator.maxTouchPoints > 0);
+}
+
+document.addEventListener('input', event => {
+    const input = event.target;
+    if (!(input instanceof HTMLTextAreaElement) || input.id !== 'send_textarea') return;
+    if (event.isTrusted || !isTouchComposerDevice()) return;
+    if (!document.querySelector('#itr_translate_button')?.classList.contains('itr-busy')) return;
+
+    suppressTranslatedComposerFocus = true;
+    queueMicrotask(() => {
+        suppressTranslatedComposerFocus = false;
+    });
+}, true);
+
+document.addEventListener('focusin', event => {
+    const input = event.target;
+    if (!suppressTranslatedComposerFocus || !(input instanceof HTMLTextAreaElement) || input.id !== 'send_textarea') return;
+
+    suppressTranslatedComposerFocus = false;
+    input.blur();
+}, true);
+
 getTranslationTokenLimit();
 ensureTokenLimitUi();
