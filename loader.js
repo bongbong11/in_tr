@@ -3,6 +3,7 @@ import { ConnectionManagerRequestService } from '../../shared.js';
 const originalSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
 const translationMarker = 'You are a skilled Korean-to-English literary translator.';
 const compileMarker = 'Convert the notes below into concise English translation-reference settings.';
+const compilePayloadMarker = 'Return only the finished Markdown settings. No commentary or code fences.\n\n';
 const alreadyEnhanced = 'Render Korean idioms, proverbs, culturally specific expressions';
 const oldCapsRule = '- Use ALL CAPS only for genuine shouting or screaming.';
 const enhancedBlock = `- Render Korean idioms, proverbs, culturally specific expressions, speech habits, implications, and emotional nuance as the closest natural equivalent in the target setting rather than translating them literally.
@@ -11,6 +12,7 @@ const enhancedBlock = `- Render Korean idioms, proverbs, culturally specific exp
 - Use ALL CAPS for genuine shouting or intense anger, including when repeated exclamation marks in SOURCE clearly signal that intensity.`;
 
 const EXTENSION_NAME_KO = '알잘딱깔센';
+const KOREAN_RE = /[\u3131-\u318E\uAC00-\uD7A3]/;
 
 function compactStoredSettings() {
     const context = SillyTavern.getContext();
@@ -54,6 +56,13 @@ function compactStoredSettings() {
 function saveCompactedSettings() {
     const context = SillyTavern.getContext();
     if (compactStoredSettings()) context.saveSettingsDebounced?.();
+}
+
+function getCompileInput(prompt) {
+    if (typeof prompt !== 'string' || !prompt.includes(compileMarker)) return '';
+    const index = prompt.lastIndexOf(compilePayloadMarker);
+    if (index < 0) return '';
+    return prompt.slice(index + compilePayloadMarker.length).trim();
 }
 
 function syncMobileViewport() {
@@ -144,7 +153,16 @@ if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
     ConnectionManagerRequestService.sendRequest = async function(profileId, prompt, maxTokens, custom, overridePayload) {
         let patchedPrompt = prompt;
         const isTranslation = typeof patchedPrompt === 'string' && patchedPrompt.includes(translationMarker);
-        const isTranslatorRequest = isTranslation || (typeof patchedPrompt === 'string' && patchedPrompt.includes(compileMarker));
+        const isCompile = typeof patchedPrompt === 'string' && patchedPrompt.includes(compileMarker);
+        const isTranslatorRequest = isTranslation || isCompile;
+
+        if (isCompile) {
+            const compileInput = getCompileInput(patchedPrompt);
+            if (compileInput && !KOREAN_RE.test(compileInput)) {
+                setTimeout(saveCompactedSettings, 0);
+                return { content: compileInput };
+            }
+        }
 
         if (isTranslation) {
             if (!patchedPrompt.includes(alreadyEnhanced)) {
