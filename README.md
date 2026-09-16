@@ -1,6 +1,6 @@
-# Input Translator
+# Context Korean to English
 
-SillyTavern용 인풋 번역 확장입니다.
+SillyTavern용 한국어→영어 인풋 번역 확장입니다.
 
 ## 주요 기능
 
@@ -19,7 +19,7 @@ SillyTavern용 인풋 번역 확장입니다.
 
 ## 번역 설정
 
-마법봉(Extensions) 메뉴의 **인풋 번역 설정**에서 관리합니다.
+마법봉(Extensions) 메뉴의 **번역 설정 관리**에서 관리합니다.
 
 - `연결` 탭: Connection Profile / 참고 대화 턴 수
 - `번역 설정` 탭: 설정 목록, 추가, 보기, 수정, 삭제
