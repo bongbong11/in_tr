@@ -18,6 +18,7 @@ const SOURCE_CLOSE = '</SOURCE>';
 const CHUNK_TRIGGER_CHARS = 2200;
 const CHUNK_TARGET_CHARS = 1400;
 const MAX_PARALLEL_CHUNKS = 2;
+const TRANSLATION_MAX_TOKENS = 4096;
 
 let capturedOriginal = '';
 
@@ -87,11 +88,6 @@ function replaceSourceInPrompt(prompt, source) {
     return `${prompt.slice(0, start + SOURCE_OPEN.length)}\n${source}\n${prompt.slice(end)}`;
 }
 
-function getFastMaxTokens(source) {
-    const estimated = Math.ceil(String(source ?? '').length * 1.35) + 192;
-    return Math.max(384, Math.min(1536, estimated));
-}
-
 function findSplitPoint(text, limit) {
     if (text.length <= limit) return { index: text.length, separator: '' };
 
@@ -154,9 +150,11 @@ async function mapWithConcurrency(items, limit, worker) {
 }
 
 function getCompatibleOverride(overridePayload) {
-    // Do not force reasoning_effort here. Custom/OpenAI-compatible endpoints may reject values
-    // such as `min` even when SillyTavern itself supports that enum.
-    return { ...(overridePayload ?? {}) };
+    const override = { ...(overridePayload ?? {}) };
+    // Translation should not force a reasoning/thinking mode. Let the selected profile/provider decide.
+    delete override.reasoning_effort;
+    delete override.include_reasoning;
+    return override;
 }
 
 function extractContent(response) {
@@ -168,12 +166,13 @@ function extractContent(response) {
 async function fastTranslationRequest(profileId, prompt, maxTokens, custom, overridePayload) {
     const source = getSourceFromPrompt(prompt);
     const compatibleOverride = getCompatibleOverride(overridePayload);
+    const outputTokens = Math.max(Number(maxTokens) || 0, TRANSLATION_MAX_TOKENS);
 
     if (!source || source.length <= CHUNK_TRIGGER_CHARS) {
         return originalSendRequest(
             profileId,
             prompt,
-            Math.min(maxTokens, getFastMaxTokens(source)),
+            outputTokens,
             custom,
             compatibleOverride,
         );
@@ -185,7 +184,7 @@ async function fastTranslationRequest(profileId, prompt, maxTokens, custom, over
         return originalSendRequest(
             profileId,
             chunkPrompt,
-            Math.min(maxTokens, getFastMaxTokens(chunk.text)),
+            outputTokens,
             custom,
             compatibleOverride,
         );
