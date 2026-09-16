@@ -7,20 +7,35 @@ const KOREAN_ONLY_TOAST = '스탑! 저는 한글 원문만 번역해요.';
 const TRANSLATION_MARKER = 'You are a skilled Korean-to-English literary translator.';
 const COMPILE_MARKER = 'Convert the notes below into concise English translation-reference settings.';
 const MAX_USAGE_RECORDS = 50;
-const USAGE_STORAGE_KEY = 'tokenUsageRecords';
 const MAX_UNDO_RECORDS = 30;
+const USAGE_STORAGE_KEY = 'tokenUsageRecords';
+const USAGE_ENABLED_KEY = 'tokenUsageEnabled';
 
 const usageRecords = [];
-const usageSessions = new WeakMap();
 const undoRecords = [];
 let usageHydrated = false;
 let pendingOriginal = '';
 let composerAnchor = null;
+let composerObserver = null;
+let composerSyncFrame = 0;
 
 function getExtensionState() {
     const context = SillyTavern.getContext();
     context.extensionSettings.inputTranslator ??= {};
     return context.extensionSettings.inputTranslator;
+}
+
+function saveExtensionState() {
+    SillyTavern.getContext().saveSettingsDebounced?.();
+}
+
+function isUsageTrackingEnabled() {
+    return getExtensionState()[USAGE_ENABLED_KEY] === true;
+}
+
+function setUsageTrackingEnabled(enabled) {
+    getExtensionState()[USAGE_ENABLED_KEY] = Boolean(enabled);
+    saveExtensionState();
 }
 
 function hydrateUsageRecords() {
@@ -35,7 +50,6 @@ function hydrateUsageRecords() {
         usageRecords.push({
             input: Math.max(0, Math.round(Number(item.input) || 0)),
             output: Math.max(0, Math.round(Number(item.output) || 0)),
-            requests: Math.max(1, Math.round(Number(item.requests) || 1)),
             profile: String(item.profile ?? ''),
             model: String(item.model ?? ''),
             time: Number(item.time) || Date.now(),
@@ -44,9 +58,27 @@ function hydrateUsageRecords() {
 }
 
 function persistUsageRecords() {
-    const settings = getExtensionState();
-    settings[USAGE_STORAGE_KEY] = usageRecords.slice(0, MAX_USAGE_RECORDS).map(record => ({ ...record }));
-    SillyTavern.getContext().saveSettingsDebounced?.();
+    getExtensionState()[USAGE_STORAGE_KEY] = usageRecords
+        .slice(0, MAX_USAGE_RECORDS)
+        .map(record => ({ ...record }));
+    saveExtensionState();
+}
+
+function addUsageRecord(input, output, profile) {
+    hydrateUsageRecords();
+    const record = {
+        input: Math.max(0, Math.round(Number(input) || 0)),
+        output: Math.max(0, Math.round(Number(output) || 0)),
+        profile: String(profile?.name ?? ''),
+        model: String(profile?.model ?? ''),
+        time: Date.now(),
+    };
+
+    usageRecords.unshift(record);
+    if (usageRecords.length > MAX_USAGE_RECORDS) usageRecords.length = MAX_USAGE_RECORDS;
+    persistUsageRecords();
+    console.info(`[알잘딱깔센] 번역 토큰 ${formatNumber(record.input)} → ${formatNumber(record.output)} · ${record.model || record.profile || '모델 미상'}`);
+    renderUsageTracker();
 }
 
 function getProfile(profileId) {
@@ -65,16 +97,16 @@ function getProfileSource(profile) {
 function buildTranslatorOverride(profile, overridePayload) {
     const override = { ...(overridePayload ?? {}) };
 
-    // The extension must not choose thinking/reasoning or prompt post-processing.
-    // Remove only legacy translator-forced values so the selected Connection
-    // Profile/provider remains authoritative for those settings.
+    // Legacy versions of this extension injected these values. Remove only
+    // those translator-side overrides so the selected Connection Profile and
+    // provider remain authoritative for thinking and prompt post-processing.
     delete override.reasoning_effort;
     delete override.include_reasoning;
     delete override.custom_prompt_post_processing;
 
-    // Custom AI's normal generation path also forwards these global Custom
-    // endpoint fields. Mirror them without changing the profile's URL, model,
-    // secret, prompt post-processing, or reasoning settings.
+    // Match normal Custom AI generation for user-defined extra request fields,
+    // without replacing the profile URL, secret, model, post-processing, or
+    // thinking configuration.
     if (getProfileSource(profile) === 'custom') {
         override.custom_include_headers = substituteParams(oai_settings.custom_include_headers ?? '');
         override.custom_include_body = substituteParams(oai_settings.custom_include_body ?? '');
@@ -111,7 +143,7 @@ function rememberUndo(original, translation) {
 
     const duplicate = undoRecords.findIndex(item => item.translation === result);
     if (duplicate >= 0) undoRecords.splice(duplicate, 1);
-    undoRecords.unshift({ original: source, translation: result, time: Date.now() });
+    undoRecords.unshift({ original: source, translation: result });
     if (undoRecords.length > MAX_UNDO_RECORDS) undoRecords.length = MAX_UNDO_RECORDS;
 }
 
@@ -262,62 +294,65 @@ function isVisibleControl(element) {
 }
 
 function findComposerAnchor(rightSendForm, button) {
-    if (composerAnchor?.isConnected && composerAnchor.parentElement === rightSendForm) return composerAnchor;
-
-    const sendButton = rightSendForm.querySelector('#send_but');
-    const candidates = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
-
-    // Prefer the persistent control immediately left of the send button. This
-    // is the user's film/keyboard-style slot on the current composer layout.
-    if (sendButton && isVisibleControl(sendButton)) {
-        const sendIndex = candidates.indexOf(sendButton);
-        if (sendIndex > 0) {
-            composerAnchor = candidates[sendIndex - 1];
-            return composerAnchor;
-        }
+    if (composerAnchor?.isConnected && composerAnchor.parentElement === rightSendForm && isVisibleControl(composerAnchor)) {
+        return composerAnchor;
     }
+    composerAnchor = null;
 
+    const candidates = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
     const likelyFilmControl = candidates.find(element =>
         element.matches('.fa-film, .fa-keyboard, .fa-clapperboard, [class*="film"], [class*="keyboard"]') ||
         /film|keyboard|필름|키보드/i.test(`${element.id} ${element.className} ${element.getAttribute('title') ?? ''}`),
     );
-    if (likelyFilmControl) {
-        composerAnchor = likelyFilmControl;
-        return composerAnchor;
+    if (likelyFilmControl) return (composerAnchor = likelyFilmControl);
+
+    const sendButton = rightSendForm.querySelector('#send_but');
+    if (sendButton && isVisibleControl(sendButton)) {
+        const sendIndex = candidates.indexOf(sendButton);
+        if (sendIndex > 0) return (composerAnchor = candidates[sendIndex - 1]);
     }
 
-    return sendButton || rightSendForm.lastElementChild;
+    return (composerAnchor = sendButton || rightSendForm.lastElementChild);
 }
 
 function stabilizeTranslateButton() {
     injectComposerButtonStyle();
-
     const button = document.querySelector('#itr_translate_button');
     const rightSendForm = document.querySelector('#rightSendForm');
-    if (!button || !rightSendForm) return;
+    if (!button || !rightSendForm) return false;
 
     const anchor = findComposerAnchor(rightSendForm, button);
-    if (!anchor || anchor === button) return;
+    if (!anchor || anchor === button) return false;
 
     if (button.parentElement !== rightSendForm || button.nextElementSibling !== anchor) {
         anchor.before(button);
     }
-
-    // Match the anchor's flex order so DOM adjacency remains real even when
-    // SillyTavern gives send/continue controls explicit order values.
     button.style.setProperty('order', getComputedStyle(anchor).order || '0', 'important');
+    return true;
 }
 
-function normalizeContextOption() {
-    hydrateUsageRecords();
-    stabilizeTranslateButton();
+function scheduleComposerSync() {
+    if (composerSyncFrame) return;
+    composerSyncFrame = requestAnimationFrame(() => {
+        composerSyncFrame = 0;
+        stabilizeTranslateButton();
+    });
+}
 
-    const select = document.querySelector('#itr_context_turns');
-    const offOption = select?.querySelector('option[value="0"]');
-    if (offOption && offOption.textContent !== '0개 선택 · 참고 안 함') {
-        offOption.textContent = '0개 선택 · 참고 안 함';
-    }
-    ensureUsageTrackerUi();
+function installComposerObserver() {
+    const rightSendForm = document.querySelector('#rightSendForm');
+    if (!rightSendForm) return false;
+    stabilizeTranslateButton();
+    if (composerObserver) return true;
+
+    composerObserver = new MutationObserver(scheduleComposerSync);
+    composerObserver.observe(rightSendForm, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['class', 'style', 'hidden'],
+    });
+    return true;
 }
 
 async function countTokens(text) {
@@ -350,120 +385,28 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
-function getUsageSession(signal, profile) {
-    if (!signal || (typeof signal !== 'object' && typeof signal !== 'function')) {
-        return {
-            input: 0, output: 0, requests: 0, active: 0, pendingCounts: 0,
-            finalized: false, failed: false,
-            profile: profile?.name || '', model: profile?.model || '', startedAt: Date.now(),
-        };
-    }
-
-    let session = usageSessions.get(signal);
-    if (!session) {
-        session = {
-            input: 0, output: 0, requests: 0, active: 0, pendingCounts: 0,
-            finalized: false, failed: false,
-            profile: profile?.name || '', model: profile?.model || '', startedAt: Date.now(),
-        };
-        usageSessions.set(signal, session);
-    }
-    return session;
-}
-
-function finalizeUsageSession(session) {
-    if (!session || session.finalized || session.active > 0 || session.pendingCounts > 0) return;
-    session.finalized = true;
-    if (session.failed && session.output <= 0) return;
-
-    hydrateUsageRecords();
-    const record = {
-        input: Math.round(session.input),
-        output: Math.round(session.output),
-        requests: session.requests,
-        profile: session.profile,
-        model: session.model,
-        time: Date.now(),
-    };
-
-    usageRecords.unshift(record);
-    if (usageRecords.length > MAX_USAGE_RECORDS) usageRecords.length = MAX_USAGE_RECORDS;
-    persistUsageRecords();
-
-    console.info(`[알잘딱깔센] 번역 토큰 ${formatNumber(record.input)} → ${formatNumber(record.output)} · ${record.model || record.profile || '모델 미상'}${record.requests > 1 ? ` (${record.requests} requests)` : ''}`);
-    renderUsageTracker();
-}
-
-function scheduleUsageFinalize(session) {
-    setTimeout(() => finalizeUsageSession(session), 0);
-}
-
-function addCountTask(session, kind, text) {
-    session.pendingCounts += 1;
-    countTokens(text)
-        .then(count => { session[kind] += count; })
-        .catch(error => console.debug('[알잘딱깔센] Token count failed:', error))
-        .finally(() => {
-            session.pendingCounts = Math.max(0, session.pendingCounts - 1);
-            scheduleUsageFinalize(session);
-        });
-}
-
 function injectUsageStyles() {
     if (document.querySelector('#itr_usage_tracker_style')) return;
     const style = document.createElement('style');
     style.id = 'itr_usage_tracker_style';
     style.textContent = `
 #itr_token_usage_wrap { margin-top: 4px; }
+.itr-usage-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; cursor: pointer; }
+.itr-usage-toggle input { margin: 0; }
+.itr-usage-toggle-note { display: block; margin-bottom: 8px; opacity: .7; line-height: 1.35; }
 #itr_token_usage_button { width: 100%; justify-content: center; }
 #itr_token_usage_panel { margin-top: 8px; padding: 10px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 10px; background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 82%, transparent); }
 .itr-usage-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
-.itr-usage-head strong { font-size: 0.95em; }
-#itr_token_usage_clear { min-width: auto; padding: 4px 8px; font-size: 0.8em; }
+#itr_token_usage_clear { min-width: auto; padding: 4px 8px; font-size: .8em; }
 .itr-usage-latest { padding: 10px; margin-bottom: 8px; border-radius: 8px; background: color-mix(in srgb, var(--SmartThemeBodyColor) 7%, transparent); }
-.itr-usage-latest-value { font-size: 1.18em; font-weight: 700; letter-spacing: 0.01em; }
+.itr-usage-latest-value { font-size: 1.18em; font-weight: 700; }
 .itr-usage-list { display: flex; flex-direction: column; gap: 5px; max-height: 230px; overflow-y: auto; }
 .itr-usage-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 6px 2px; border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 55%, transparent); }
-.itr-usage-meta { min-width: 0; font-size: 0.78em; opacity: 0.72; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.itr-usage-value { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: 0.9em; }
-.itr-usage-note { display: block; margin-top: 8px; opacity: 0.65; line-height: 1.35; }
+.itr-usage-meta { min-width: 0; font-size: .78em; opacity: .72; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.itr-usage-value { font-variant-numeric: tabular-nums; white-space: nowrap; font-size: .9em; }
+.itr-usage-note { display: block; margin-top: 8px; opacity: .65; line-height: 1.35; }
 `;
     document.head.appendChild(style);
-}
-
-function ensureUsageTrackerUi() {
-    hydrateUsageRecords();
-    injectUsageStyles();
-    const stack = document.querySelector('#itr_settings_overlay #itr_panel_body .itr-form-stack');
-    if (!stack || document.querySelector('#itr_token_usage_wrap')) return;
-
-    const wrap = document.createElement('div');
-    wrap.id = 'itr_token_usage_wrap';
-    wrap.innerHTML = `
-        <button type="button" id="itr_token_usage_button" class="menu_button">📊 토큰 사용량</button>
-        <div id="itr_token_usage_panel" hidden>
-            <div class="itr-usage-head">
-                <strong>번역 토큰 추적</strong>
-                <button type="button" id="itr_token_usage_clear" class="menu_button">기록 지우기</button>
-            </div>
-            <div id="itr_token_usage_content"></div>
-            <small class="itr-usage-note">최근 50회 번역의 모델과 입력 → 출력 토큰을 확장 전체 설정에 저장합니다. 토큰 수는 SillyTavern 토크나이저 기준이라 제공사 과금 집계와 소폭 다를 수 있습니다.</small>
-        </div>`;
-    stack.appendChild(wrap);
-
-    const button = wrap.querySelector('#itr_token_usage_button');
-    const panel = wrap.querySelector('#itr_token_usage_panel');
-    button.addEventListener('click', () => {
-        panel.hidden = !panel.hidden;
-        renderUsageTracker();
-    });
-    wrap.querySelector('#itr_token_usage_clear').addEventListener('click', () => {
-        usageRecords.length = 0;
-        persistUsageRecords();
-        renderUsageTracker();
-    });
-
-    renderUsageTracker();
 }
 
 function getRecordLabel(record) {
@@ -474,10 +417,12 @@ function getRecordLabel(record) {
 
 function renderUsageTracker() {
     hydrateUsageRecords();
+    const toggle = document.querySelector('#itr_token_usage_enabled');
     const button = document.querySelector('#itr_token_usage_button');
     const content = document.querySelector('#itr_token_usage_content');
     const latest = usageRecords[0];
 
+    if (toggle) toggle.checked = isUsageTrackingEnabled();
     if (button) {
         button.textContent = latest
             ? `📊 토큰 사용량 · ${formatNumber(latest.input)} → ${formatNumber(latest.output)}`
@@ -495,10 +440,9 @@ function renderUsageTracker() {
     const rows = usageRecords.map(record => {
         const time = new Date(record.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const safeLabel = escapeHtml(getRecordLabel(record));
-        const requestNote = record.requests > 1 ? ` · ${record.requests}회 분할` : '';
         return `
             <div class="itr-usage-row">
-                <div class="itr-usage-meta" title="${safeLabel}">${escapeHtml(time)} · ${safeLabel}${requestNote}</div>
+                <div class="itr-usage-meta" title="${safeLabel}">${escapeHtml(time)} · ${safeLabel}</div>
                 <div class="itr-usage-value">${formatNumber(record.input)} → ${formatNumber(record.output)}</div>
             </div>`;
     }).join('');
@@ -511,9 +455,76 @@ function renderUsageTracker() {
         <div class="itr-usage-list">${rows}</div>`;
 }
 
+function ensureUsageTrackerUi() {
+    const stack = document.querySelector('#itr_settings_overlay #itr_panel_body .itr-form-stack');
+    if (!stack || document.querySelector('#itr_token_usage_wrap')) return;
+
+    hydrateUsageRecords();
+    injectUsageStyles();
+
+    const wrap = document.createElement('div');
+    wrap.id = 'itr_token_usage_wrap';
+    wrap.innerHTML = `
+        <label class="itr-usage-toggle">
+            <input type="checkbox" id="itr_token_usage_enabled">
+            <span>토큰 사용량 계산</span>
+        </label>
+        <small class="itr-usage-toggle-note">필요할 때만 켜세요. 끄면 번역 중 토큰 계산 요청을 전혀 하지 않습니다.</small>
+        <button type="button" id="itr_token_usage_button" class="menu_button">📊 토큰 사용량</button>
+        <div id="itr_token_usage_panel" hidden>
+            <div class="itr-usage-head">
+                <strong>번역 토큰 기록</strong>
+                <button type="button" id="itr_token_usage_clear" class="menu_button">기록 지우기</button>
+            </div>
+            <div id="itr_token_usage_content"></div>
+            <small class="itr-usage-note">계산을 켠 동안의 최근 50회만 저장합니다. 기존 기록은 계산을 꺼도 유지됩니다.</small>
+        </div>`;
+    stack.appendChild(wrap);
+
+    const toggle = wrap.querySelector('#itr_token_usage_enabled');
+    toggle.checked = isUsageTrackingEnabled();
+    toggle.addEventListener('change', () => {
+        setUsageTrackingEnabled(toggle.checked);
+        renderUsageTracker();
+    });
+
+    const panel = wrap.querySelector('#itr_token_usage_panel');
+    wrap.querySelector('#itr_token_usage_button').addEventListener('click', () => {
+        panel.hidden = !panel.hidden;
+        renderUsageTracker();
+    });
+    wrap.querySelector('#itr_token_usage_clear').addEventListener('click', () => {
+        usageRecords.length = 0;
+        persistUsageRecords();
+        renderUsageTracker();
+    });
+
+    renderUsageTracker();
+}
+
+function normalizeSettingsUi() {
+    const menuLabel = document.querySelector('#itr_wand_settings span');
+    if (menuLabel) menuLabel.textContent = '알잘딱깔센';
+    const title = document.querySelector('#itr_settings_overlay .itr-title');
+    if (title) title.textContent = '알잘딱깔센';
+    const panel = document.querySelector('#itr_settings_overlay .itr-panel');
+    if (panel) panel.setAttribute('aria-label', '알잘딱깔센');
+
+    const select = document.querySelector('#itr_context_turns');
+    const offOption = select?.querySelector('option[value="0"]');
+    if (offOption) offOption.textContent = '0개 선택 · 참고 안 함';
+    ensureUsageTrackerUi();
+}
+
+function handleSettingsUiClick(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target?.closest('#itr_wand_settings, #itr_settings_overlay')) return;
+    setTimeout(normalizeSettingsUi, 0);
+}
+
 // Keep URL, secret, model, thinking and prompt post-processing from the selected
-// Connection Profile/provider. The extension only suppresses RP preset/instruct
-// injection through index.js and adds the translation prompt itself.
+// Connection Profile/provider. Generation preset/instruct injection remains
+// disabled by index.js; this wrapper only adds translator-specific fields.
 if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     const baseSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
 
@@ -524,43 +535,39 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
 
         const profile = getProfile(profileId);
         const override = buildTranslatorOverride(profile, overridePayload);
-
-        if (!isTranslationPrompt(prompt)) {
+        const shouldTrack = isTranslationPrompt(prompt) && isUsageTrackingEnabled();
+        if (!shouldTrack) {
             return baseSendRequest(profileId, prompt, maxTokens, custom, override);
         }
 
-        const session = getUsageSession(custom?.signal, profile);
-        session.active += 1;
-        session.requests += 1;
-        addCountTask(session, 'input', prompt);
-
-        try {
-            const response = await baseSendRequest(profileId, prompt, maxTokens, custom, override);
-            addCountTask(session, 'output', response?.content ?? '');
-            return response;
-        } catch (error) {
-            session.failed = true;
-            throw error;
-        } finally {
-            session.active = Math.max(0, session.active - 1);
-            scheduleUsageFinalize(session);
-        }
+        // Start counting without blocking the API request. The translation is
+        // returned immediately after the provider responds; usage bookkeeping
+        // finishes asynchronously afterwards.
+        const inputCountPromise = countTokens(prompt);
+        const response = await baseSendRequest(profileId, prompt, maxTokens, custom, override);
+        Promise.all([inputCountPromise, countTokens(response?.content ?? '')])
+            .then(([input, output]) => addUsageRecord(input, output, profile))
+            .catch(error => console.debug('[알잘딱깔센] Token usage count failed:', error));
+        return response;
     };
 
     ConnectionManagerRequestService.__inputTranslatorThinkingGuard = true;
 }
 
-// Register cross-chat undo before loader.js installs its older compatibility
-// handler, so matching translated text always restores the correct original.
 document.addEventListener('click', handleUniversalUndo, true);
 document.addEventListener('input', captureCompletedTranslation, true);
 document.addEventListener('click', stopNonKoreanTranslation, true);
 document.addEventListener('keydown', stopNonKoreanTranslation, true);
-
-const contextOptionObserver = new MutationObserver(normalizeContextOption);
-contextOptionObserver.observe(document.documentElement, { childList: true, subtree: true });
+document.addEventListener('click', handleSettingsUiClick, true);
 
 await import('./loader.js');
 hydrateUsageRecords();
-stabilizeTranslateButton();
-normalizeContextOption();
+normalizeSettingsUi();
+
+// One short bounded startup retry replaces the previous document-wide
+// MutationObserver. Once found, only #rightSendForm itself is observed.
+let observerAttempts = 0;
+const observerTimer = setInterval(() => {
+    observerAttempts += 1;
+    if (installComposerObserver() || observerAttempts >= 100) clearInterval(observerTimer);
+}, 100);
