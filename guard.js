@@ -1,4 +1,6 @@
 import { ConnectionManagerRequestService } from '../../shared.js';
+import { oai_settings } from '../../../openai.js';
+import { substituteParams } from '../../../../script.js';
 
 const KOREAN_SOURCE_RE = /[\u3131-\u318E\uAC00-\uD7A3]/;
 const KOREAN_ONLY_TOAST = '스탑! 저는 한글 원문만 번역해요.';
@@ -40,6 +42,34 @@ function getProfile(profileId) {
     } catch {
         return null;
     }
+}
+
+function getProfileSource(profile) {
+    const apiMap = SillyTavern.getContext().CONNECT_API_MAP?.[profile?.api];
+    return String(apiMap?.source ?? '').toLowerCase();
+}
+
+function buildTranslatorOverride(profile, overridePayload) {
+    const override = { ...(overridePayload ?? {}) };
+
+    // Never force thinking/reasoning from the extension. Let the selected
+    // Connection Profile/provider decide. Also do not blank the profile's
+    // own prompt post-processing setting.
+    delete override.reasoning_effort;
+    delete override.include_reasoning;
+    delete override.custom_prompt_post_processing;
+
+    // ConnectionManagerRequestService does not automatically forward the
+    // Custom AI extra header/body fields that normal SillyTavern generation
+    // sends. Preserve them here so custom OpenAI-compatible endpoints receive
+    // the same auth/body customization as the user's normal Custom AI setup.
+    if (getProfileSource(profile) === 'custom') {
+        override.custom_include_headers = substituteParams(oai_settings.custom_include_headers ?? '');
+        override.custom_include_body = substituteParams(oai_settings.custom_include_body ?? '');
+        override.custom_exclude_body = substituteParams(oai_settings.custom_exclude_body ?? '');
+    }
+
+    return override;
 }
 
 function isTranslatorPrompt(prompt) {
@@ -267,8 +297,8 @@ function renderUsageTracker() {
         <div class="itr-usage-list">${rows}</div>`;
 }
 
-// Do not override thinking/reasoning. The selected Connection Profile/provider owns those settings.
-// This wrapper only strips per-request reasoning overrides introduced by this extension stack.
+// Keep provider/model/auth and thinking behavior from the selected Connection Profile.
+// Only the roleplay generation preset/instruct injection remains disabled by index.js.
 if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     const baseSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
 
@@ -278,9 +308,7 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
         }
 
         const profile = getProfile(profileId);
-        const override = { ...(overridePayload ?? {}) };
-        delete override.reasoning_effort;
-        delete override.include_reasoning;
+        const override = buildTranslatorOverride(profile, overridePayload);
 
         if (!isTranslationPrompt(prompt)) {
             return baseSendRequest(profileId, prompt, maxTokens, custom, override);
