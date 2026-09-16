@@ -10,7 +10,7 @@ const enhancedBlock = `- Render Korean idioms, proverbs, culturally specific exp
 - If no direct equivalent exists, recreate the intended nuance naturally without inventing new facts or changing the underlying meaning.
 - Use ALL CAPS for genuine shouting or intense anger, including when repeated exclamation marks in SOURCE clearly signal that intensity.`;
 
-const EXTENSION_NAME_KO = '문맥 한영 번역기';
+const EXTENSION_NAME_KO = '알잘딱깔센';
 
 function compactStoredSettings() {
     const context = SillyTavern.getContext();
