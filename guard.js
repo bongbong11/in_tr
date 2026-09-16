@@ -92,6 +92,15 @@ function formatNumber(value) {
     return Number(value || 0).toLocaleString('en-US');
 }
 
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
 function getUsageSession(signal, profile) {
     if (!signal || (typeof signal !== 'object' && typeof signal !== 'function')) {
         return {
@@ -99,6 +108,7 @@ function getUsageSession(signal, profile) {
             output: 0,
             requests: 0,
             active: 0,
+            pendingCounts: 0,
             finalized: false,
             failed: false,
             profile: profile?.name || '',
@@ -114,6 +124,7 @@ function getUsageSession(signal, profile) {
             output: 0,
             requests: 0,
             active: 0,
+            pendingCounts: 0,
             finalized: false,
             failed: false,
             profile: profile?.name || '',
@@ -126,7 +137,7 @@ function getUsageSession(signal, profile) {
 }
 
 function finalizeUsageSession(session) {
-    if (!session || session.finalized || session.active > 0) return;
+    if (!session || session.finalized || session.active > 0 || session.pendingCounts > 0) return;
     session.finalized = true;
 
     if (session.failed && session.output <= 0) return;
@@ -149,6 +160,19 @@ function finalizeUsageSession(session) {
 
 function scheduleUsageFinalize(session) {
     setTimeout(() => finalizeUsageSession(session), 0);
+}
+
+function addCountTask(session, kind, text) {
+    session.pendingCounts += 1;
+    countTokens(text)
+        .then(count => {
+            session[kind] += count;
+        })
+        .catch(error => console.debug('[알잘딱깔센] Token count failed:', error))
+        .finally(() => {
+            session.pendingCounts = Math.max(0, session.pendingCounts - 1);
+            scheduleUsageFinalize(session);
+        });
 }
 
 function injectUsageStyles() {
@@ -238,10 +262,11 @@ function renderUsageTracker() {
     const rows = usageRecords.map(record => {
         const time = new Date(record.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         const name = record.model || record.profile || '번역 모델';
+        const safeName = escapeHtml(name);
         const requestNote = record.requests > 1 ? ` · ${record.requests}회 분할` : '';
         return `
             <div class="itr-usage-row">
-                <div class="itr-usage-meta" title="${name}">${time} · ${name}${requestNote}</div>
+                <div class="itr-usage-meta" title="${safeName}">${escapeHtml(time)} · ${safeName}${requestNote}</div>
                 <div class="itr-usage-value">${formatNumber(record.input)} → ${formatNumber(record.output)}</div>
             </div>`;
     }).join('');
@@ -281,11 +306,11 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
         const session = getUsageSession(custom?.signal, profile);
         session.active += 1;
         session.requests += 1;
+        addCountTask(session, 'input', prompt);
 
         try {
-            session.input += await countTokens(prompt);
             const response = await baseSendRequest(profileId, prompt, maxTokens, custom, override);
-            session.output += await countTokens(response?.content ?? '');
+            addCountTask(session, 'output', response?.content ?? '');
             return response;
         } catch (error) {
             session.failed = true;
