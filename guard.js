@@ -15,7 +15,6 @@ const usageRecords = [];
 const undoRecords = [];
 let usageHydrated = false;
 let pendingOriginal = '';
-let composerAnchor = null;
 let composerObserver = null;
 let composerSyncFrame = 0;
 
@@ -41,7 +40,6 @@ function setUsageTrackingEnabled(enabled) {
 function hydrateUsageRecords() {
     if (usageHydrated) return;
     usageHydrated = true;
-
     const stored = getExtensionState()[USAGE_STORAGE_KEY];
     if (!Array.isArray(stored)) return;
 
@@ -73,7 +71,6 @@ function addUsageRecord(input, output, profile) {
         model: String(profile?.model ?? ''),
         time: Date.now(),
     };
-
     usageRecords.unshift(record);
     if (usageRecords.length > MAX_USAGE_RECORDS) usageRecords.length = MAX_USAGE_RECORDS;
     persistUsageRecords();
@@ -96,23 +93,15 @@ function getProfileSource(profile) {
 
 function buildTranslatorOverride(profile, overridePayload) {
     const override = { ...(overridePayload ?? {}) };
-
-    // Legacy versions of this extension injected these values. Remove only
-    // those translator-side overrides so the selected Connection Profile and
-    // provider remain authoritative for thinking and prompt post-processing.
     delete override.reasoning_effort;
     delete override.include_reasoning;
     delete override.custom_prompt_post_processing;
 
-    // Match normal Custom AI generation for user-defined extra request fields,
-    // without replacing the profile URL, secret, model, post-processing, or
-    // thinking configuration.
     if (getProfileSource(profile) === 'custom') {
         override.custom_include_headers = substituteParams(oai_settings.custom_include_headers ?? '');
         override.custom_include_body = substituteParams(oai_settings.custom_include_body ?? '');
         override.custom_exclude_body = substituteParams(oai_settings.custom_exclude_body ?? '');
     }
-
     return override;
 }
 
@@ -140,7 +129,6 @@ function rememberUndo(original, translation) {
     const source = String(original ?? '');
     const result = String(translation ?? '');
     if (!source.trim() || !result.trim() || source === result) return;
-
     const duplicate = undoRecords.findIndex(item => item.translation === result);
     if (duplicate >= 0) undoRecords.splice(duplicate, 1);
     undoRecords.unshift({ original: source, translation: result });
@@ -167,8 +155,8 @@ function closeUniversalPopover() {
 function showUniversalPopover(record) {
     const anchor = document.querySelector('#itr_translate_button');
     if (!anchor || !record) return;
-
     closeUniversalPopover();
+
     const popover = document.createElement('div');
     popover.id = 'itr_action_popover';
     popover.className = 'itr-action-popover';
@@ -226,11 +214,9 @@ function handleUniversalUndo(event) {
 function captureCompletedTranslation(event) {
     const input = event.target;
     if (!(input instanceof HTMLTextAreaElement) || input.id !== 'send_textarea' || !pendingOriginal) return;
-
     const button = document.querySelector('#itr_translate_button');
     const value = String(input.value ?? '');
     if (!button?.classList.contains('itr-busy') || !value.trim() || value === pendingOriginal) return;
-
     rememberUndo(pendingOriginal, value);
     pendingOriginal = '';
 }
@@ -252,7 +238,6 @@ function stopNonKoreanTranslation(event) {
 
     event.preventDefault();
     event.stopImmediatePropagation();
-
     if (typeof window.toastr?.warning === 'function') {
         window.toastr.warning(KOREAN_ONLY_TOAST, undefined, { preventDuplicates: true });
     } else {
@@ -290,40 +275,45 @@ function isVisibleControl(element) {
     if (!(element instanceof HTMLElement)) return false;
     if (element.classList.contains('displayNone')) return false;
     const style = getComputedStyle(element);
-    return style.display !== 'none' && style.visibility !== 'hidden';
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
 }
 
-function findComposerAnchor(rightSendForm, button) {
-    if (composerAnchor?.isConnected && composerAnchor.parentElement === rightSendForm && isVisibleControl(composerAnchor)) {
-        return composerAnchor;
-    }
-    composerAnchor = null;
+function findFilmSlot(rightSendForm, button) {
+    const controls = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
+    if (!controls.length) return null;
 
-    const candidates = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
-    const likelyFilmControl = candidates.find(element =>
+    // Prefer an explicit film/keyboard-like control if an extension exposes one.
+    const semantic = controls.find(element =>
         element.matches('.fa-film, .fa-keyboard, .fa-clapperboard, [class*="film"], [class*="keyboard"]') ||
         /film|keyboard|필름|키보드/i.test(`${element.id} ${element.className} ${element.getAttribute('title') ?? ''}`),
     );
+    if (semantic) return semantic;
 
-    let baseAnchor = likelyFilmControl;
-    if (!baseAnchor) {
-        const sendButton = rightSendForm.querySelector('#send_but');
-        if (sendButton && isVisibleControl(sendButton)) {
-            const sendIndex = candidates.indexOf(sendButton);
-            if (sendIndex > 0) baseAnchor = candidates[sendIndex - 1];
-        }
-        baseAnchor ??= sendButton || rightSendForm.lastElementChild;
+    // Otherwise use geometry, not DOM order. SillyTavern gives send/continue
+    // controls explicit flex orders, so DOM adjacency can disagree with what is
+    // actually on screen. The wanted slot is the visible control immediately
+    // to the LEFT of the active send/stop button.
+    const activeAction = [
+        rightSendForm.querySelector('#send_but'),
+        rightSendForm.querySelector('#mes_stop'),
+    ].find(isVisibleControl);
+
+    if (activeAction) {
+        const actionRect = activeAction.getBoundingClientRect();
+        const leftControls = controls
+            .filter(element => element !== activeAction)
+            .map(element => ({ element, rect: element.getBoundingClientRect() }))
+            .filter(item => item.rect.right <= actionRect.left + 3)
+            .sort((a, b) => b.rect.right - a.rect.right);
+        if (leftControls.length) return leftControls[0].element;
     }
 
-    // The previous build placed the globe immediately before baseAnchor.
-    // Move it exactly one additional visible control slot to the left.
-    const baseIndex = candidates.indexOf(baseAnchor);
-    if (baseIndex > 0) {
-        composerAnchor = candidates[baseIndex - 1];
-    } else {
-        composerAnchor = baseAnchor;
-    }
-    return composerAnchor;
+    // Last fallback: right-most visible non-action control.
+    const nonAction = controls.filter(element => !element.matches('#send_but, #mes_stop'));
+    return (nonAction.length ? nonAction : controls)
+        .map(element => ({ element, left: element.getBoundingClientRect().left }))
+        .sort((a, b) => b.left - a.left)[0]?.element ?? null;
 }
 
 function stabilizeTranslateButton() {
@@ -332,13 +322,20 @@ function stabilizeTranslateButton() {
     const rightSendForm = document.querySelector('#rightSendForm');
     if (!button || !rightSendForm) return false;
 
-    const anchor = findComposerAnchor(rightSendForm, button);
-    if (!anchor || anchor === button) return false;
+    const filmSlot = findFilmSlot(rightSendForm, button);
+    if (!filmSlot || filmSlot === button) return false;
 
-    if (button.parentElement !== rightSendForm || button.nextElementSibling !== anchor) {
-        anchor.before(button);
+    // Exact target from the UI: globe immediately LEFT of the film icon.
+    if (button.parentElement !== rightSendForm || button.nextElementSibling !== filmSlot) {
+        filmSlot.before(button);
     }
-    button.style.setProperty('order', getComputedStyle(anchor).order || '0', 'important');
+
+    // Match the film control's flex order. With the globe inserted before it,
+    // equal order guarantees globe → film → send/stop. Do not touch send/stop.
+    const targetOrder = getComputedStyle(filmSlot).order || '0';
+    if (button.style.getPropertyValue('order') !== targetOrder || button.style.getPropertyPriority('order') !== 'important') {
+        button.style.setProperty('order', targetOrder, 'important');
+    }
     return true;
 }
 
@@ -369,7 +366,6 @@ function installComposerObserver() {
 async function countTokens(text) {
     const value = String(text ?? '');
     if (!value) return 0;
-
     try {
         const counter = SillyTavern.getContext()?.getTokenCountAsync;
         if (typeof counter === 'function') {
@@ -379,7 +375,6 @@ async function countTokens(text) {
     } catch (error) {
         console.debug('[알잘딱깔센] Token counter fallback:', error);
     }
-
     return Math.max(1, Math.ceil(value.length / 4));
 }
 
@@ -469,7 +464,6 @@ function renderUsageTracker() {
 function ensureUsageTrackerUi() {
     const stack = document.querySelector('#itr_settings_overlay #itr_panel_body .itr-form-stack');
     if (!stack || document.querySelector('#itr_token_usage_wrap')) return;
-
     hydrateUsageRecords();
     injectUsageStyles();
 
@@ -509,7 +503,6 @@ function ensureUsageTrackerUi() {
         persistUsageRecords();
         renderUsageTracker();
     });
-
     renderUsageTracker();
 }
 
@@ -533,12 +526,8 @@ function handleSettingsUiClick(event) {
     setTimeout(normalizeSettingsUi, 0);
 }
 
-// Keep URL, secret, model, thinking and prompt post-processing from the selected
-// Connection Profile/provider. Generation preset/instruct injection remains
-// disabled by index.js; this wrapper only adds translator-specific fields.
 if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     const baseSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
-
     ConnectionManagerRequestService.sendRequest = async function(profileId, prompt, maxTokens, custom, overridePayload) {
         if (!isTranslatorPrompt(prompt)) {
             return baseSendRequest(profileId, prompt, maxTokens, custom, overridePayload);
@@ -551,9 +540,6 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
             return baseSendRequest(profileId, prompt, maxTokens, custom, override);
         }
 
-        // Start counting without blocking the API request. The translation is
-        // returned immediately after the provider responds; usage bookkeeping
-        // finishes asynchronously afterwards.
         const inputCountPromise = countTokens(prompt);
         const response = await baseSendRequest(profileId, prompt, maxTokens, custom, override);
         Promise.all([inputCountPromise, countTokens(response?.content ?? '')])
@@ -561,7 +547,6 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
             .catch(error => console.debug('[알잘딱깔센] Token usage count failed:', error));
         return response;
     };
-
     ConnectionManagerRequestService.__inputTranslatorThinkingGuard = true;
 }
 
@@ -575,8 +560,6 @@ await import('./loader.js');
 hydrateUsageRecords();
 normalizeSettingsUi();
 
-// One short bounded startup retry replaces the previous document-wide
-// MutationObserver. Once found, only #rightSendForm itself is observed.
 let observerAttempts = 0;
 const observerTimer = setInterval(() => {
     observerAttempts += 1;
