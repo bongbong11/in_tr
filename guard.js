@@ -42,17 +42,6 @@ function getProfile(profileId) {
     }
 }
 
-function getApiSource(profile) {
-    if (!profile) return '';
-    const map = SillyTavern.getContext().CONNECT_API_MAP?.[profile.api];
-    return String(map?.source ?? '').toLowerCase();
-}
-
-function isNativeGeminiProfile(profile) {
-    const source = getApiSource(profile);
-    return source === 'makersuite' || source === 'vertexai' || source === 'google';
-}
-
 function isTranslatorPrompt(prompt) {
     return typeof prompt === 'string' && (prompt.includes(TRANSLATION_MARKER) || prompt.includes(COMPILE_MARKER));
 }
@@ -84,7 +73,6 @@ async function countTokens(text) {
         console.debug('[알잘딱깔센] Token counter fallback:', error);
     }
 
-    // Last-resort estimate only when SillyTavern's tokenizer is unavailable.
     return Math.max(1, Math.ceil(value.length / 4));
 }
 
@@ -279,9 +267,8 @@ function renderUsageTracker() {
         <div class="itr-usage-list">${rows}</div>`;
 }
 
-// Translation requests do not need visible chain-of-thought. Suppress it for every provider.
-// Native Gemini also gets the minimum supported thinking level. Custom/OpenAI-compatible
-// endpoints do not receive reasoning_effort because many reject unsupported values.
+// Do not override thinking/reasoning. The selected Connection Profile/provider owns those settings.
+// This wrapper only strips per-request reasoning overrides introduced by this extension stack.
 if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     const baseSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
 
@@ -291,13 +278,9 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
         }
 
         const profile = getProfile(profileId);
-        const override = { ...(overridePayload ?? {}), include_reasoning: false };
-
-        if (isNativeGeminiProfile(profile)) {
-            override.reasoning_effort = 'min';
-        } else {
-            delete override.reasoning_effort;
-        }
+        const override = { ...(overridePayload ?? {}) };
+        delete override.reasoning_effort;
+        delete override.include_reasoning;
 
         if (!isTranslationPrompt(prompt)) {
             return baseSendRequest(profileId, prompt, maxTokens, custom, override);
