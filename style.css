@@ -176,7 +176,10 @@
 }
 
 .itr-panel-body {
+    min-height: 0;
     overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
     padding: 14px;
 }
 
@@ -351,21 +354,36 @@
 
 @media (max-width: 600px) {
     .itr-overlay {
+        inset: auto 0 auto 0;
+        top: var(--itr-viewport-top, 0px);
+        width: 100vw;
+        height: var(--itr-viewport-height, 100dvh);
+        box-sizing: border-box;
         align-items: flex-end;
-        padding: 0;
+        justify-content: center;
+        overflow: hidden;
+        padding: max(8px, env(safe-area-inset-top)) 0 max(6px, env(safe-area-inset-bottom));
     }
 
     .itr-panel {
         width: 100%;
-        max-height: 90dvh;
+        max-height: calc(var(--itr-viewport-height, 100dvh) - max(22px, env(safe-area-inset-top)) - max(10px, env(safe-area-inset-bottom)));
+        margin: 0;
         border-radius: 14px 14px 0 0;
         border-left: 0;
         border-right: 0;
         border-bottom: 0;
     }
 
+    .itr-header,
+    .itr-tabs {
+        flex: 0 0 auto;
+    }
+
     .itr-panel-body {
+        min-height: 0;
         padding: 12px;
+        padding-bottom: calc(12px + env(safe-area-inset-bottom));
     }
 
     .itr-note-input {
