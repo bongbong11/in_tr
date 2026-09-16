@@ -1,5 +1,5 @@
 {
-  "display_name": "문맥 한영 번역기",
+  "display_name": "알잘딱깔센",
   "loading_order": 20,
   "requires": [],
   "optional": [],
@@ -7,7 +7,7 @@
   "js": "loader.js",
   "css": "style.css",
   "author": "bongbong11",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "homePage": "https://github.com/bongbong11/in_tr",
   "auto_update": true
 }
