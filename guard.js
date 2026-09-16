@@ -8,10 +8,14 @@ const TRANSLATION_MARKER = 'You are a skilled Korean-to-English literary transla
 const COMPILE_MARKER = 'Convert the notes below into concise English translation-reference settings.';
 const MAX_USAGE_RECORDS = 50;
 const USAGE_STORAGE_KEY = 'tokenUsageRecords';
+const MAX_UNDO_RECORDS = 30;
 
 const usageRecords = [];
 const usageSessions = new WeakMap();
+const undoRecords = [];
 let usageHydrated = false;
+let pendingOriginal = '';
+let composerAnchor = null;
 
 function getExtensionState() {
     const context = SillyTavern.getContext();
@@ -45,31 +49,6 @@ function persistUsageRecords() {
     SillyTavern.getContext().saveSettingsDebounced?.();
 }
 
-function isIdleTranslateButton(target) {
-    const button = target instanceof Element ? target.closest('#itr_translate_button') : null;
-    if (!button) return null;
-    if (button.classList.contains('itr-busy') || button.classList.contains('itr-complete')) return null;
-    return button;
-}
-
-function stopNonKoreanTranslation(event) {
-    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
-    const button = isIdleTranslateButton(event.target);
-    if (!button) return;
-
-    const source = String(document.querySelector('#send_textarea')?.value ?? '');
-    if (!source.trim() || KOREAN_SOURCE_RE.test(source)) return;
-
-    event.preventDefault();
-    event.stopImmediatePropagation();
-
-    if (typeof window.toastr?.warning === 'function') {
-        window.toastr.warning(KOREAN_ONLY_TOAST, undefined, { preventDuplicates: true });
-    } else {
-        console.info(`[알잘딱깔센] ${KOREAN_ONLY_TOAST}`);
-    }
-}
-
 function getProfile(profileId) {
     try {
         return ConnectionManagerRequestService.getSupportedProfiles().find(profile => profile.id === profileId) ?? null;
@@ -86,17 +65,16 @@ function getProfileSource(profile) {
 function buildTranslatorOverride(profile, overridePayload) {
     const override = { ...(overridePayload ?? {}) };
 
-    // Never force thinking/reasoning from the extension. Let the selected
-    // Connection Profile/provider decide. Also do not blank the profile's
-    // own prompt post-processing setting.
+    // The extension must not choose thinking/reasoning or prompt post-processing.
+    // Remove only legacy translator-forced values so the selected Connection
+    // Profile/provider remains authoritative for those settings.
     delete override.reasoning_effort;
     delete override.include_reasoning;
     delete override.custom_prompt_post_processing;
 
-    // ConnectionManagerRequestService does not automatically forward the
-    // Custom AI extra header/body fields that normal SillyTavern generation
-    // sends. Preserve them here so custom OpenAI-compatible endpoints receive
-    // the same customization as the user's normal Custom AI setup.
+    // Custom AI's normal generation path also forwards these global Custom
+    // endpoint fields. Mirror them without changing the profile's URL, model,
+    // secret, prompt post-processing, or reasoning settings.
     if (getProfileSource(profile) === 'custom') {
         override.custom_include_headers = substituteParams(oai_settings.custom_include_headers ?? '');
         override.custom_include_body = substituteParams(oai_settings.custom_include_body ?? '');
@@ -104,36 +82,6 @@ function buildTranslatorOverride(profile, overridePayload) {
     }
 
     return override;
-}
-
-function isCustomAuthError(profile, error) {
-    if (getProfileSource(profile) !== 'custom') return false;
-    const message = String(error?.message ?? error ?? '');
-    return /(?:401|unauthorized|invalid[_\s-]*api[_\s-]*key|invalid session)/i.test(message);
-}
-
-async function sendTranslatorRequest(baseSendRequest, profile, profileId, prompt, maxTokens, custom, override) {
-    try {
-        return await baseSendRequest(profileId, prompt, maxTokens, custom, override);
-    } catch (error) {
-        if (!isCustomAuthError(profile, error)) throw error;
-
-        // A Connection Profile can retain an older Custom secret id while the
-        // currently active Custom AI connection works normally. Retry once
-        // using the active Custom AI URL/key selection, while keeping the
-        // profile's model and the translator request itself unchanged.
-        const fallbackOverride = {
-            ...override,
-            secret_id: undefined,
-            custom_url: oai_settings.custom_url || profile?.['api-url'],
-            custom_include_headers: substituteParams(oai_settings.custom_include_headers ?? ''),
-            custom_include_body: substituteParams(oai_settings.custom_include_body ?? ''),
-            custom_exclude_body: substituteParams(oai_settings.custom_exclude_body ?? ''),
-        };
-
-        console.warn('[알잘딱깔센] Custom AI profile auth failed; retrying with the active Custom AI credentials.');
-        return await baseSendRequest(profileId, prompt, maxTokens, custom, fallbackOverride);
-    }
 }
 
 function isTranslatorPrompt(prompt) {
@@ -144,13 +92,148 @@ function isTranslationPrompt(prompt) {
     return typeof prompt === 'string' && prompt.includes(TRANSLATION_MARKER);
 }
 
+function getComposer() {
+    return document.querySelector('#send_textarea');
+}
+
+function setComposerValue(value) {
+    const input = getComposer();
+    if (!input) return;
+    input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus({ preventScroll: true });
+}
+
+function rememberUndo(original, translation) {
+    const source = String(original ?? '');
+    const result = String(translation ?? '');
+    if (!source.trim() || !result.trim() || source === result) return;
+
+    const duplicate = undoRecords.findIndex(item => item.translation === result);
+    if (duplicate >= 0) undoRecords.splice(duplicate, 1);
+    undoRecords.unshift({ original: source, translation: result, time: Date.now() });
+    if (undoRecords.length > MAX_UNDO_RECORDS) undoRecords.length = MAX_UNDO_RECORDS;
+}
+
+function findUndoRecord(value) {
+    const text = String(value ?? '');
+    return undoRecords.find(item => item.translation === text) ?? null;
+}
+
+function resetTranslateButton() {
+    const button = document.querySelector('#itr_translate_button');
+    if (!button) return;
+    button.classList.remove('itr-busy', 'itr-complete');
+    button.textContent = '🌐';
+    button.title = '입력 번역';
+}
+
+function closeUniversalPopover() {
+    document.querySelector('#itr_action_popover')?.remove();
+}
+
+function showUniversalPopover(record) {
+    const anchor = document.querySelector('#itr_translate_button');
+    if (!anchor || !record) return;
+
+    closeUniversalPopover();
+    const popover = document.createElement('div');
+    popover.id = 'itr_action_popover';
+    popover.className = 'itr-action-popover';
+
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.textContent = '↻ 재번역';
+    retry.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeUniversalPopover();
+        setComposerValue(record.original);
+        resetTranslateButton();
+        setTimeout(() => document.querySelector('#itr_translate_button')?.click(), 0);
+    }, true);
+
+    const restore = document.createElement('button');
+    restore.type = 'button';
+    restore.textContent = '↶ 되돌리기';
+    restore.addEventListener('click', event => {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        closeUniversalPopover();
+        pendingOriginal = '';
+        setComposerValue(record.original);
+        resetTranslateButton();
+    }, true);
+
+    popover.append(retry, restore);
+    document.body.appendChild(popover);
+
+    const rect = anchor.getBoundingClientRect();
+    const popRect = popover.getBoundingClientRect();
+    popover.style.left = `${Math.min(window.innerWidth - popRect.width - 8, Math.max(8, rect.right - popRect.width))}px`;
+    popover.style.top = `${Math.max(8, rect.top - popRect.height - 8)}px`;
+}
+
+function handleUniversalUndo(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    const button = target?.closest('#itr_translate_button');
+    if (!button || button.classList.contains('itr-busy')) return;
+
+    const value = String(getComposer()?.value ?? '');
+    const record = findUndoRecord(value);
+    if (!record) {
+        if (!button.classList.contains('itr-complete') && value.trim()) pendingOriginal = value;
+        return;
+    }
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    showUniversalPopover(record);
+}
+
+function captureCompletedTranslation(event) {
+    const input = event.target;
+    if (!(input instanceof HTMLTextAreaElement) || input.id !== 'send_textarea' || !pendingOriginal) return;
+
+    const button = document.querySelector('#itr_translate_button');
+    const value = String(input.value ?? '');
+    if (!button?.classList.contains('itr-busy') || !value.trim() || value === pendingOriginal) return;
+
+    rememberUndo(pendingOriginal, value);
+    pendingOriginal = '';
+}
+
+function isIdleTranslateButton(target) {
+    const button = target instanceof Element ? target.closest('#itr_translate_button') : null;
+    if (!button) return null;
+    if (button.classList.contains('itr-busy') || button.classList.contains('itr-complete')) return null;
+    return button;
+}
+
+function stopNonKoreanTranslation(event) {
+    if (event.type === 'keydown' && event.key !== 'Enter' && event.key !== ' ') return;
+    const button = isIdleTranslateButton(event.target);
+    if (!button) return;
+
+    const source = String(getComposer()?.value ?? '');
+    if (!source.trim() || KOREAN_SOURCE_RE.test(source) || findUndoRecord(source)) return;
+
+    event.preventDefault();
+    event.stopImmediatePropagation();
+
+    if (typeof window.toastr?.warning === 'function') {
+        window.toastr.warning(KOREAN_ONLY_TOAST, undefined, { preventDuplicates: true });
+    } else {
+        console.info(`[알잘딱깔센] ${KOREAN_ONLY_TOAST}`);
+    }
+}
+
 function injectComposerButtonStyle() {
     if (document.querySelector('#itr_composer_button_stability_style')) return;
     const style = document.createElement('style');
     style.id = 'itr_composer_button_stability_style';
     style.textContent = `
-#itr_translate_button {
-    order: 3 !important;
+#rightSendForm > #itr_translate_button {
     flex: 0 0 var(--bottomFormBlockSize) !important;
     width: var(--bottomFormBlockSize) !important;
     min-width: var(--bottomFormBlockSize) !important;
@@ -171,20 +254,58 @@ function injectComposerButtonStyle() {
     document.head.appendChild(style);
 }
 
+function isVisibleControl(element) {
+    if (!(element instanceof HTMLElement)) return false;
+    if (element.classList.contains('displayNone')) return false;
+    const style = getComputedStyle(element);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+}
+
+function findComposerAnchor(rightSendForm, button) {
+    if (composerAnchor?.isConnected && composerAnchor.parentElement === rightSendForm) return composerAnchor;
+
+    const sendButton = rightSendForm.querySelector('#send_but');
+    const candidates = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
+
+    // Prefer the persistent control immediately left of the send button. This
+    // is the user's film/keyboard-style slot on the current composer layout.
+    if (sendButton && isVisibleControl(sendButton)) {
+        const sendIndex = candidates.indexOf(sendButton);
+        if (sendIndex > 0) {
+            composerAnchor = candidates[sendIndex - 1];
+            return composerAnchor;
+        }
+    }
+
+    const likelyFilmControl = candidates.find(element =>
+        element.matches('.fa-film, .fa-keyboard, .fa-clapperboard, [class*="film"], [class*="keyboard"]') ||
+        /film|keyboard|필름|키보드/i.test(`${element.id} ${element.className} ${element.getAttribute('title') ?? ''}`),
+    );
+    if (likelyFilmControl) {
+        composerAnchor = likelyFilmControl;
+        return composerAnchor;
+    }
+
+    return sendButton || rightSendForm.lastElementChild;
+}
+
 function stabilizeTranslateButton() {
     injectComposerButtonStyle();
 
     const button = document.querySelector('#itr_translate_button');
     const rightSendForm = document.querySelector('#rightSendForm');
-    const sendForm = document.querySelector('#send_form');
-    if (!button || !rightSendForm || !sendForm || rightSendForm.parentElement !== sendForm) return;
+    if (!button || !rightSendForm) return;
 
-    // Keep the translator button outside rightSendForm. send/stop button state
-    // changes can resize/reflow rightSendForm; being its sibling prevents the
-    // globe from jumping to the far right while generation is running.
-    if (button.parentElement !== sendForm || rightSendForm.previousElementSibling !== button) {
-        rightSendForm.before(button);
+    const anchor = findComposerAnchor(rightSendForm, button);
+    if (!anchor || anchor === button) return;
+
+    if (button.parentElement !== rightSendForm || button.nextElementSibling !== anchor) {
+        anchor.before(button);
     }
+
+    // Match the anchor's flex order so DOM adjacency remains real even when
+    // SillyTavern gives send/continue controls explicit order values.
+    button.style.setProperty('order', getComputedStyle(anchor).order || '0', 'important');
 }
 
 function normalizeContextOption() {
@@ -232,32 +353,18 @@ function escapeHtml(value) {
 function getUsageSession(signal, profile) {
     if (!signal || (typeof signal !== 'object' && typeof signal !== 'function')) {
         return {
-            input: 0,
-            output: 0,
-            requests: 0,
-            active: 0,
-            pendingCounts: 0,
-            finalized: false,
-            failed: false,
-            profile: profile?.name || '',
-            model: profile?.model || '',
-            startedAt: Date.now(),
+            input: 0, output: 0, requests: 0, active: 0, pendingCounts: 0,
+            finalized: false, failed: false,
+            profile: profile?.name || '', model: profile?.model || '', startedAt: Date.now(),
         };
     }
 
     let session = usageSessions.get(signal);
     if (!session) {
         session = {
-            input: 0,
-            output: 0,
-            requests: 0,
-            active: 0,
-            pendingCounts: 0,
-            finalized: false,
-            failed: false,
-            profile: profile?.name || '',
-            model: profile?.model || '',
-            startedAt: Date.now(),
+            input: 0, output: 0, requests: 0, active: 0, pendingCounts: 0,
+            finalized: false, failed: false,
+            profile: profile?.name || '', model: profile?.model || '', startedAt: Date.now(),
         };
         usageSessions.set(signal, session);
     }
@@ -267,7 +374,6 @@ function getUsageSession(signal, profile) {
 function finalizeUsageSession(session) {
     if (!session || session.finalized || session.active > 0 || session.pendingCounts > 0) return;
     session.finalized = true;
-
     if (session.failed && session.output <= 0) return;
 
     hydrateUsageRecords();
@@ -295,9 +401,7 @@ function scheduleUsageFinalize(session) {
 function addCountTask(session, kind, text) {
     session.pendingCounts += 1;
     countTokens(text)
-        .then(count => {
-            session[kind] += count;
-        })
+        .then(count => { session[kind] += count; })
         .catch(error => console.debug('[알잘딱깔센] Token count failed:', error))
         .finally(() => {
             session.pendingCounts = Math.max(0, session.pendingCounts - 1);
@@ -312,22 +416,11 @@ function injectUsageStyles() {
     style.textContent = `
 #itr_token_usage_wrap { margin-top: 4px; }
 #itr_token_usage_button { width: 100%; justify-content: center; }
-#itr_token_usage_panel {
-    margin-top: 8px;
-    padding: 10px;
-    border: 1px solid var(--SmartThemeBorderColor);
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 82%, transparent);
-}
+#itr_token_usage_panel { margin-top: 8px; padding: 10px; border: 1px solid var(--SmartThemeBorderColor); border-radius: 10px; background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 82%, transparent); }
 .itr-usage-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .itr-usage-head strong { font-size: 0.95em; }
 #itr_token_usage_clear { min-width: auto; padding: 4px 8px; font-size: 0.8em; }
-.itr-usage-latest {
-    padding: 10px;
-    margin-bottom: 8px;
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--SmartThemeBodyColor) 7%, transparent);
-}
+.itr-usage-latest { padding: 10px; margin-bottom: 8px; border-radius: 8px; background: color-mix(in srgb, var(--SmartThemeBodyColor) 7%, transparent); }
 .itr-usage-latest-value { font-size: 1.18em; font-weight: 700; letter-spacing: 0.01em; }
 .itr-usage-list { display: flex; flex-direction: column; gap: 5px; max-height: 230px; overflow-y: auto; }
 .itr-usage-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 6px 2px; border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 55%, transparent); }
@@ -401,8 +494,7 @@ function renderUsageTracker() {
     const latestModel = escapeHtml(getRecordLabel(latest));
     const rows = usageRecords.map(record => {
         const time = new Date(record.time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        const label = getRecordLabel(record);
-        const safeLabel = escapeHtml(label);
+        const safeLabel = escapeHtml(getRecordLabel(record));
         const requestNote = record.requests > 1 ? ` · ${record.requests}회 분할` : '';
         return `
             <div class="itr-usage-row">
@@ -419,8 +511,9 @@ function renderUsageTracker() {
         <div class="itr-usage-list">${rows}</div>`;
 }
 
-// Keep provider/model/auth and thinking behavior from the selected Connection Profile.
-// Only the roleplay generation preset/instruct injection remains disabled by index.js.
+// Keep URL, secret, model, thinking and prompt post-processing from the selected
+// Connection Profile/provider. The extension only suppresses RP preset/instruct
+// injection through index.js and adds the translation prompt itself.
 if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     const baseSendRequest = ConnectionManagerRequestService.sendRequest.bind(ConnectionManagerRequestService);
 
@@ -433,7 +526,7 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
         const override = buildTranslatorOverride(profile, overridePayload);
 
         if (!isTranslationPrompt(prompt)) {
-            return sendTranslatorRequest(baseSendRequest, profile, profileId, prompt, maxTokens, custom, override);
+            return baseSendRequest(profileId, prompt, maxTokens, custom, override);
         }
 
         const session = getUsageSession(custom?.signal, profile);
@@ -442,7 +535,7 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
         addCountTask(session, 'input', prompt);
 
         try {
-            const response = await sendTranslatorRequest(baseSendRequest, profile, profileId, prompt, maxTokens, custom, override);
+            const response = await baseSendRequest(profileId, prompt, maxTokens, custom, override);
             addCountTask(session, 'output', response?.content ?? '');
             return response;
         } catch (error) {
@@ -457,6 +550,10 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
     ConnectionManagerRequestService.__inputTranslatorThinkingGuard = true;
 }
 
+// Register cross-chat undo before loader.js installs its older compatibility
+// handler, so matching translated text always restores the correct original.
+document.addEventListener('click', handleUniversalUndo, true);
+document.addEventListener('input', captureCompletedTranslation, true);
 document.addEventListener('click', stopNonKoreanTranslation, true);
 document.addEventListener('keydown', stopNonKoreanTranslation, true);
 
