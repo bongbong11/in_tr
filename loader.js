@@ -13,6 +13,13 @@ const enhancedBlock = `- Render Korean idioms, proverbs, culturally specific exp
 
 const EXTENSION_NAME_KO = '알잘딱깔센';
 const KOREAN_RE = /[\u3131-\u318E\uAC00-\uD7A3]/;
+const SOURCE_OPEN = '<SOURCE>';
+const SOURCE_CLOSE = '</SOURCE>';
+const CHUNK_TRIGGER_CHARS = 2200;
+const CHUNK_TARGET_CHARS = 1400;
+const MAX_PARALLEL_CHUNKS = 2;
+
+let capturedOriginal = '';
 
 function compactStoredSettings() {
     const context = SillyTavern.getContext();
@@ -63,6 +70,133 @@ function getCompileInput(prompt) {
     const index = prompt.lastIndexOf(compilePayloadMarker);
     if (index < 0) return '';
     return prompt.slice(index + compilePayloadMarker.length).trim();
+}
+
+function getSourceFromPrompt(prompt) {
+    if (typeof prompt !== 'string') return '';
+    const start = prompt.lastIndexOf(SOURCE_OPEN);
+    const end = prompt.lastIndexOf(SOURCE_CLOSE);
+    if (start < 0 || end <= start) return '';
+    return prompt.slice(start + SOURCE_OPEN.length, end).replace(/^\n|\n$/g, '');
+}
+
+function replaceSourceInPrompt(prompt, source) {
+    const start = prompt.lastIndexOf(SOURCE_OPEN);
+    const end = prompt.lastIndexOf(SOURCE_CLOSE);
+    if (start < 0 || end <= start) return prompt;
+    return `${prompt.slice(0, start + SOURCE_OPEN.length)}\n${source}\n${prompt.slice(end)}`;
+}
+
+function getFastMaxTokens(source) {
+    const estimated = Math.ceil(String(source ?? '').length * 1.35) + 192;
+    return Math.max(384, Math.min(1536, estimated));
+}
+
+function findSplitPoint(text, limit) {
+    if (text.length <= limit) return { index: text.length, separator: '' };
+
+    const floor = Math.floor(limit * 0.55);
+    const window = text.slice(floor, limit + 1);
+
+    const candidates = [
+        /\n{2,}/g,
+        /\n/g,
+        /[.!?。！？](?:["'”’)]*)\s+/g,
+        /\s+/g,
+    ];
+
+    for (const regex of candidates) {
+        let match;
+        let last = null;
+        while ((match = regex.exec(window)) !== null) last = match;
+        if (last) {
+            const absolute = floor + last.index;
+            return {
+                index: absolute,
+                separator: last[0],
+            };
+        }
+    }
+
+    return { index: limit, separator: '' };
+}
+
+function splitSource(source, limit = CHUNK_TARGET_CHARS) {
+    const chunks = [];
+    let remaining = String(source ?? '');
+
+    while (remaining.length > limit) {
+        const { index, separator } = findSplitPoint(remaining, limit);
+        const text = remaining.slice(0, index);
+        if (!text) break;
+        chunks.push({ text, separator });
+        remaining = remaining.slice(index + separator.length);
+    }
+
+    if (remaining || !chunks.length) chunks.push({ text: remaining, separator: '' });
+    return chunks;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+    const results = new Array(items.length);
+    let next = 0;
+
+    async function run() {
+        while (true) {
+            const index = next++;
+            if (index >= items.length) return;
+            results[index] = await worker(items[index], index);
+        }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+    return results;
+}
+
+function withFastReasoning(overridePayload) {
+    const override = { ...(overridePayload ?? {}) };
+    if (override.include_reasoning === false) override.reasoning_effort = 'min';
+    return override;
+}
+
+function extractContent(response) {
+    const content = response?.content;
+    if (typeof content !== 'string') throw new Error('번역 결과를 읽을 수 없습니다.');
+    return content;
+}
+
+async function fastTranslationRequest(profileId, prompt, maxTokens, custom, overridePayload) {
+    const source = getSourceFromPrompt(prompt);
+    const fastOverride = withFastReasoning(overridePayload);
+
+    if (!source || source.length <= CHUNK_TRIGGER_CHARS) {
+        return originalSendRequest(
+            profileId,
+            prompt,
+            Math.min(maxTokens, getFastMaxTokens(source)),
+            custom,
+            fastOverride,
+        );
+    }
+
+    const chunks = splitSource(source);
+    const responses = await mapWithConcurrency(chunks, MAX_PARALLEL_CHUNKS, async chunk => {
+        const chunkPrompt = replaceSourceInPrompt(prompt, chunk.text);
+        return originalSendRequest(
+            profileId,
+            chunkPrompt,
+            Math.min(maxTokens, getFastMaxTokens(chunk.text)),
+            custom,
+            fastOverride,
+        );
+    });
+
+    const content = responses
+        .map((response, index) => `${extractContent(response).trim()}${chunks[index].separator}`)
+        .join('')
+        .trim();
+
+    return { ...(responses[0] ?? {}), content };
 }
 
 function syncMobileViewport() {
@@ -137,7 +271,45 @@ function prepareSettingsOpen(event) {
     setTimeout(syncMobileViewport, 180);
 }
 
+function setComposerValue(value) {
+    const input = document.querySelector('#send_textarea');
+    if (!input) return;
+    input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus({ preventScroll: true });
+}
+
+function restoreCapturedOriginal(event) {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target) return;
+
+    const restoreButton = target.closest('#itr_action_popover button');
+    if (restoreButton?.textContent?.includes('되돌리기') && capturedOriginal) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        document.querySelector('#itr_action_popover')?.remove();
+        setComposerValue(capturedOriginal);
+
+        const translateButton = document.querySelector('#itr_translate_button');
+        if (translateButton) {
+            translateButton.classList.remove('itr-busy', 'itr-complete');
+            translateButton.textContent = '🌐';
+            translateButton.title = '입력 번역';
+        }
+        capturedOriginal = '';
+        return;
+    }
+
+    const translateButton = target.closest('#itr_translate_button');
+    if (!translateButton || translateButton.classList.contains('itr-busy') || translateButton.classList.contains('itr-complete')) return;
+
+    const input = document.querySelector('#send_textarea');
+    const value = String(input?.value ?? '');
+    if (value.trim()) capturedOriginal = value;
+}
+
 document.addEventListener('pointerdown', prepareSettingsOpen, true);
+document.addEventListener('click', restoreCapturedOriginal, true);
 window.visualViewport?.addEventListener('resize', syncMobileViewport);
 window.visualViewport?.addEventListener('scroll', syncMobileViewport);
 window.addEventListener('orientationchange', () => {
@@ -178,6 +350,10 @@ if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
                 .replace(/\n*<SETTINGS>\s*<\/SETTINGS>\n*/g, '\n')
                 .replace(/\n*<PREVIOUS_OUTPUT>\s*<\/PREVIOUS_OUTPUT>\n*/g, '\n')
                 .replace(/\n{3,}/g, '\n\n');
+
+            const result = await fastTranslationRequest(profileId, patchedPrompt, maxTokens, custom, overridePayload);
+            setTimeout(saveCompactedSettings, 0);
+            return result;
         }
 
         const result = await originalSendRequest(profileId, patchedPrompt, maxTokens, custom, overridePayload);
