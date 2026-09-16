@@ -10,6 +10,8 @@ const enhancedBlock = `- Render Korean idioms, proverbs, culturally specific exp
 - If no direct equivalent exists, recreate the intended nuance naturally without inventing new facts or changing the underlying meaning.
 - Use ALL CAPS for genuine shouting or intense anger, including when repeated exclamation marks in SOURCE clearly signal that intensity.`;
 
+const EXTENSION_NAME_KO = '문맥 한영 번역기';
+
 function compactStoredSettings() {
     const context = SillyTavern.getContext();
     const settings = context.extensionSettings?.inputTranslator;
@@ -62,15 +64,57 @@ function syncMobileViewport() {
     document.documentElement.style.setProperty('--itr-viewport-top', `${offsetTop}px`);
 }
 
+function injectMobileUiFix() {
+    if (document.querySelector('#itr_mobile_visibility_fix')) return;
+    const style = document.createElement('style');
+    style.id = 'itr_mobile_visibility_fix';
+    style.textContent = `
+@media (max-width: 600px) {
+    .itr-overlay {
+        top: var(--itr-viewport-top, 0px) !important;
+        bottom: auto !important;
+        height: var(--itr-viewport-height, 100dvh) !important;
+        min-height: 0 !important;
+        align-items: center !important;
+        justify-content: center !important;
+        box-sizing: border-box !important;
+        overflow: hidden !important;
+        padding: max(12px, env(safe-area-inset-top)) 10px max(12px, env(safe-area-inset-bottom)) !important;
+    }
+
+    .itr-panel {
+        width: 100% !important;
+        max-width: 560px !important;
+        max-height: calc(var(--itr-viewport-height, 100dvh) - 28px - env(safe-area-inset-top) - env(safe-area-inset-bottom)) !important;
+        margin: 0 !important;
+        border: 1px solid var(--SmartThemeBorderColor) !important;
+        border-radius: 14px !important;
+    }
+
+    .itr-header,
+    .itr-tabs {
+        flex: 0 0 auto !important;
+    }
+
+    .itr-panel-body {
+        min-height: 0 !important;
+        overflow-y: auto !important;
+        overscroll-behavior: contain !important;
+        -webkit-overflow-scrolling: touch !important;
+    }
+}`;
+    document.head.appendChild(style);
+}
+
 function normalizeVisibleLabels() {
     const menuLabel = document.querySelector('#itr_wand_settings span');
-    if (menuLabel && menuLabel.textContent !== '번역 설정 관리') menuLabel.textContent = '번역 설정 관리';
+    if (menuLabel && menuLabel.textContent !== EXTENSION_NAME_KO) menuLabel.textContent = EXTENSION_NAME_KO;
 
     const title = document.querySelector('#itr_settings_overlay .itr-title');
-    if (title && title.textContent !== '번역 설정 관리') title.textContent = '번역 설정 관리';
+    if (title && title.textContent !== EXTENSION_NAME_KO) title.textContent = EXTENSION_NAME_KO;
 
     const panel = document.querySelector('#itr_settings_overlay .itr-panel');
-    if (panel) panel.setAttribute('aria-label', '번역 설정 관리');
+    if (panel) panel.setAttribute('aria-label', EXTENSION_NAME_KO);
 }
 
 function prepareSettingsOpen(event) {
@@ -80,12 +124,17 @@ function prepareSettingsOpen(event) {
     const active = document.activeElement;
     if (active instanceof HTMLElement) active.blur();
     syncMobileViewport();
+    setTimeout(syncMobileViewport, 60);
+    setTimeout(syncMobileViewport, 180);
 }
 
 document.addEventListener('pointerdown', prepareSettingsOpen, true);
 window.visualViewport?.addEventListener('resize', syncMobileViewport);
 window.visualViewport?.addEventListener('scroll', syncMobileViewport);
-window.addEventListener('orientationchange', () => setTimeout(syncMobileViewport, 80));
+window.addEventListener('orientationchange', () => {
+    setTimeout(syncMobileViewport, 80);
+    setTimeout(syncMobileViewport, 220);
+});
 window.addEventListener('resize', syncMobileViewport);
 
 const uiObserver = new MutationObserver(() => normalizeVisibleLabels());
@@ -120,6 +169,7 @@ if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
     ConnectionManagerRequestService.__inputTranslatorNuancePatch = true;
 }
 
+injectMobileUiFix();
 syncMobileViewport();
 saveCompactedSettings();
 await import('./index.js');
