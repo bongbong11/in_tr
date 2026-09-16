@@ -53,6 +53,14 @@ function isTranslatorPrompt(prompt) {
     return typeof prompt === 'string' && (prompt.includes(TRANSLATION_MARKER) || prompt.includes(COMPILE_MARKER));
 }
 
+function normalizeContextOption() {
+    const select = document.querySelector('#itr_context_turns');
+    const offOption = select?.querySelector('option[value="0"]');
+    if (offOption && offOption.textContent !== '참고 안 함') {
+        offOption.textContent = '참고 안 함';
+    }
+}
+
 // Translation requests do not need visible chain-of-thought. Suppress it for every provider.
 // Native Gemini also gets the minimum supported thinking level. Custom/OpenAI-compatible
 // endpoints do not receive reasoning_effort because many reject unsupported values.
@@ -82,4 +90,8 @@ if (!ConnectionManagerRequestService.__inputTranslatorThinkingGuard) {
 document.addEventListener('click', stopNonKoreanTranslation, true);
 document.addEventListener('keydown', stopNonKoreanTranslation, true);
 
+const contextOptionObserver = new MutationObserver(normalizeContextOption);
+contextOptionObserver.observe(document.documentElement, { childList: true, subtree: true });
+
 await import('./loader.js');
+normalizeContextOption();
