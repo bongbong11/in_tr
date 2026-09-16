@@ -54,6 +54,43 @@ function saveCompactedSettings() {
     if (compactStoredSettings()) context.saveSettingsDebounced?.();
 }
 
+function syncMobileViewport() {
+    const viewport = window.visualViewport;
+    const height = Math.round(viewport?.height || window.innerHeight || document.documentElement.clientHeight || 0);
+    const offsetTop = Math.round(viewport?.offsetTop || 0);
+    document.documentElement.style.setProperty('--itr-viewport-height', `${height}px`);
+    document.documentElement.style.setProperty('--itr-viewport-top', `${offsetTop}px`);
+}
+
+function normalizeVisibleLabels() {
+    const menuLabel = document.querySelector('#itr_wand_settings span');
+    if (menuLabel && menuLabel.textContent !== '번역 설정 관리') menuLabel.textContent = '번역 설정 관리';
+
+    const title = document.querySelector('#itr_settings_overlay .itr-title');
+    if (title && title.textContent !== '번역 설정 관리') title.textContent = '번역 설정 관리';
+
+    const panel = document.querySelector('#itr_settings_overlay .itr-panel');
+    if (panel) panel.setAttribute('aria-label', '번역 설정 관리');
+}
+
+function prepareSettingsOpen(event) {
+    const target = event.target instanceof Element ? event.target.closest('#itr_wand_settings') : null;
+    if (!target) return;
+
+    const active = document.activeElement;
+    if (active instanceof HTMLElement) active.blur();
+    syncMobileViewport();
+}
+
+document.addEventListener('pointerdown', prepareSettingsOpen, true);
+window.visualViewport?.addEventListener('resize', syncMobileViewport);
+window.visualViewport?.addEventListener('scroll', syncMobileViewport);
+window.addEventListener('orientationchange', () => setTimeout(syncMobileViewport, 80));
+window.addEventListener('resize', syncMobileViewport);
+
+const uiObserver = new MutationObserver(() => normalizeVisibleLabels());
+uiObserver.observe(document.documentElement, { childList: true, subtree: true });
+
 if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
     ConnectionManagerRequestService.sendRequest = async function(profileId, prompt, maxTokens, custom, overridePayload) {
         let patchedPrompt = prompt;
@@ -70,7 +107,6 @@ if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
                     );
             }
 
-            // Do not spend tokens on empty optional blocks.
             patchedPrompt = patchedPrompt
                 .replace(/\n*<SETTINGS>\s*<\/SETTINGS>\n*/g, '\n')
                 .replace(/\n*<PREVIOUS_OUTPUT>\s*<\/PREVIOUS_OUTPUT>\n*/g, '\n')
@@ -84,5 +120,7 @@ if (!ConnectionManagerRequestService.__inputTranslatorNuancePatch) {
     ConnectionManagerRequestService.__inputTranslatorNuancePatch = true;
 }
 
+syncMobileViewport();
 saveCompactedSettings();
-import('./index.js');
+await import('./index.js');
+normalizeVisibleLabels();
