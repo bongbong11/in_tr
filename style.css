@@ -1,9 +1,27 @@
 #itr_translate_button {
-    order: 2;
+    /* Last in the right-hand controls. Override this variable in custom CSS. */
+    order: var(--itr-translate-button-order, 9999);
+    flex: 0 0 var(--bottomFormBlockSize);
+    width: var(--bottomFormBlockSize);
+    min-width: var(--bottomFormBlockSize);
+    height: var(--bottomFormBlockSize);
+    min-height: var(--bottomFormBlockSize);
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: center;
+    margin: var(--itr-translate-button-margin, 0);
+    position: relative;
+    inset: auto;
     user-select: none;
     -webkit-user-select: none;
     font-family: system-ui, sans-serif;
     line-height: 1;
+}
+
+#itr_translate_button.itr-hidden {
+    display: none;
 }
 
 #itr_translate_button.itr-busy {
@@ -57,7 +75,11 @@
 
 .itr-overlay {
     position: fixed;
-    inset: 0;
+    inset: var(--itr-viewport-top, 0px) 0 auto;
+    height: var(--itr-viewport-height, 100dvh);
+    min-height: 0;
+    box-sizing: border-box;
+    overflow: auto;
     z-index: 10010;
     display: none;
     align-items: center;
@@ -72,7 +94,13 @@
 
 .itr-panel {
     width: min(560px, calc(100vw - 20px));
-    max-height: min(88vh, 820px);
+    max-height: min(820px, 100%);
+    min-height: 0;
+    box-sizing: border-box;
+    flex: 0 1 auto;
+    margin: 0;
+    position: relative;
+    inset: auto;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -86,6 +114,7 @@
 }
 
 .itr-header {
+    flex: 0 0 auto;
     display: flex;
     align-items: flex-start;
     gap: 10px;
@@ -153,6 +182,7 @@
 }
 
 .itr-tabs {
+    flex: 0 0 auto;
     display: grid;
     grid-template-columns: 1fr 1fr;
     padding: 8px 10px 0;
@@ -176,6 +206,7 @@
 }
 
 .itr-panel-body {
+    flex: 1 1 auto;
     min-height: 0;
     overflow-y: auto;
     overscroll-behavior: contain;
@@ -203,6 +234,11 @@
 .itr-field small {
     opacity: 0.62;
     line-height: 1.35;
+}
+
+.itr-form-stack > small {
+    opacity: 0.7;
+    line-height: 1.4;
 }
 
 .itr-field select,

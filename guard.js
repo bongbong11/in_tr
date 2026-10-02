@@ -245,100 +245,18 @@ function stopNonKoreanTranslation(event) {
     }
 }
 
-function injectComposerButtonStyle() {
-    if (document.querySelector('#itr_composer_button_stability_style')) return;
-    const style = document.createElement('style');
-    style.id = 'itr_composer_button_stability_style';
-    style.textContent = `
-#rightSendForm > #itr_translate_button {
-    flex: 0 0 var(--bottomFormBlockSize) !important;
-    width: var(--bottomFormBlockSize) !important;
-    min-width: var(--bottomFormBlockSize) !important;
-    height: var(--bottomFormBlockSize) !important;
-    min-height: var(--bottomFormBlockSize) !important;
-    box-sizing: border-box !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    align-self: center !important;
-    margin: 0 !important;
-    position: relative !important;
-    inset: auto !important;
-    user-select: none;
-    -webkit-user-select: none;
-}
-`;
-    document.head.appendChild(style);
-}
-
-function isVisibleControl(element) {
-    if (!(element instanceof HTMLElement)) return false;
-    if (element.classList.contains('displayNone')) return false;
-    const style = getComputedStyle(element);
-    const rect = element.getBoundingClientRect();
-    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
-}
-
-function findFilmSlot(rightSendForm, button) {
-    const controls = [...rightSendForm.children].filter(element => element !== button && isVisibleControl(element));
-    if (!controls.length) return null;
-
-    // Prefer an explicit film/keyboard-like control if an extension exposes one.
-    const semantic = controls.find(element =>
-        element.matches('.fa-film, .fa-keyboard, .fa-clapperboard, [class*="film"], [class*="keyboard"]') ||
-        /film|keyboard|필름|키보드/i.test(`${element.id} ${element.className} ${element.getAttribute('title') ?? ''}`),
-    );
-    if (semantic) return semantic;
-
-    // Otherwise use geometry, not DOM order. SillyTavern gives send/continue
-    // controls explicit flex orders, so DOM adjacency can disagree with what is
-    // actually on screen. The wanted slot is the visible control immediately
-    // to the LEFT of the active send/stop button.
-    const activeAction = [
-        rightSendForm.querySelector('#send_but'),
-        rightSendForm.querySelector('#mes_stop'),
-    ].find(isVisibleControl);
-
-    if (activeAction) {
-        const actionRect = activeAction.getBoundingClientRect();
-        const leftControls = controls
-            .filter(element => element !== activeAction)
-            .map(element => ({ element, rect: element.getBoundingClientRect() }))
-            .filter(item => item.rect.right <= actionRect.left + 3)
-            .sort((a, b) => b.rect.right - a.rect.right);
-        if (leftControls.length) return leftControls[0].element;
-    }
-
-    // Last fallback: right-most visible non-action control.
-    const nonAction = controls.filter(element => !element.matches('#send_but, #mes_stop'));
-    return (nonAction.length ? nonAction : controls)
-        .map(element => ({ element, left: element.getBoundingClientRect().left }))
-        .sort((a, b) => b.left - a.left)[0]?.element ?? null;
-}
-
 function stabilizeTranslateButton() {
-    injectComposerButtonStyle();
     const button = document.querySelector('#itr_translate_button');
     const rightSendForm = document.querySelector('#rightSendForm');
     if (!button || !rightSendForm) return false;
 
-    const filmSlot = findFilmSlot(rightSendForm, button);
-    if (!filmSlot || filmSlot === button) return false;
-
-    // Exact target from the UI: globe immediately LEFT of the film icon.
-    if (button.parentElement !== rightSendForm || button.nextElementSibling !== filmSlot) {
-        filmSlot.before(button);
-    }
-
-    // Match the film control's flex order. With the globe inserted before it,
-    // equal order guarantees globe → film → send/stop. Do not touch send/stop.
-    const targetOrder = getComputedStyle(filmSlot).order || '0';
-    if (button.style.getPropertyValue('order') !== targetOrder || button.style.getPropertyPriority('order') !== 'important') {
-        button.style.setProperty('order', targetOrder, 'important');
+    // Keep the globe last in the right-hand controls. Position and order are
+    // defined in style.css so custom CSS can override them without a JS race.
+    if (button.parentElement !== rightSendForm || rightSendForm.lastElementChild !== button) {
+        rightSendForm.appendChild(button);
     }
     return true;
 }
-
 function scheduleComposerSync() {
     if (composerSyncFrame) return;
     composerSyncFrame = requestAnimationFrame(() => {

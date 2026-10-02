@@ -1,4 +1,6 @@
 import { ConnectionManagerRequestService } from '../../shared.js';
+import { getCurrentChatId, is_send_press, sendTextareaMessage } from '../../../../script.js';
+import { shouldSendOnEnter } from '../../../RossAscends-mods.js';
 
 const MODULE_NAME = 'inputTranslator';
 const MAX_TRANSLATION_TOKENS = 2048;
@@ -9,6 +11,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     contextTurns: 1,
     activePresetId: '',
     presets: [],
+    autoTranslateOnSend: false,
+    showTranslateButton: true,
 });
 
 // General translator prompt only. Character/RP-specific settings are never hard-coded here.
@@ -65,6 +69,8 @@ const runtime = {
     lastTranslation: '',
     actionPopover: null,
     editorBusy: false,
+    autoSendPending: false,
+    inputRevision: 0,
 };
 
 function getContext() {
@@ -77,6 +83,8 @@ function cloneDefaults() {
         contextTurns: 1,
         activePresetId: '',
         presets: [],
+        autoTranslateOnSend: false,
+        showTranslateButton: true,
     };
 }
 
@@ -91,6 +99,8 @@ function getSettings() {
         : 1;
     settings.activePresetId ??= '';
     settings.presets = Array.isArray(settings.presets) ? settings.presets : [];
+    settings.autoTranslateOnSend = settings.autoTranslateOnSend === true;
+    settings.showTranslateButton = settings.showTranslateButton !== false;
 
     return settings;
 }
@@ -245,6 +255,8 @@ function setTranslateButtonState(mode) {
 
     button.classList.toggle('itr-busy', mode === 'busy');
     button.classList.toggle('itr-complete', mode === 'complete');
+    // Always leave cancellation accessible, even when the globe is hidden.
+    button.classList.toggle('itr-hidden', !getSettings().showTranslateButton && mode !== 'busy');
 
     if (mode === 'busy') {
         button.textContent = '■';
@@ -255,15 +267,24 @@ function setTranslateButtonState(mode) {
     }
 }
 
-async function translateSource(source) {
+const KOREAN_INPUT_RE = /[\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF]/;
+
+async function translateSource(source, { autoSend = false } = {}) {
+    if (runtime.currentAbortController) return null;
     const settings = getSettings();
     if (!settings.profileId || !getProfile(settings.profileId)) {
         toast('warning', '먼저 번역용 Connection Profile을 선택해 주세요.');
         openSettings('connection');
-        return;
+        return null;
     }
 
-    runtime.currentAbortController = new AbortController();
+    const controller = new AbortController();
+    const input = getInputElement();
+    const initialValue = input?.value;
+    const revision = runtime.inputRevision;
+    const chat = getContext().chat;
+    const chatId = getCurrentChatId();
+    runtime.currentAbortController = controller;
     setTranslateButtonState('busy');
     closeActionPopover();
 
@@ -273,25 +294,136 @@ async function translateSource(source) {
             settings.profileId,
             prompt,
             MAX_TRANSLATION_TOKENS,
-            runtime.currentAbortController.signal,
+            controller.signal,
         );
+        // Providers may still resolve after abort. Never use that late result.
+        if (controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (input !== getInputElement() || input?.value !== initialValue ||
+            runtime.inputRevision !== revision || chat !== getContext().chat || chatId !== getCurrentChatId()) {
+            throw new Error('입력 내용이나 대화가 바뀌어 번역을 적용하지 않았습니다. 다시 번역해 주세요.');
+        }
         const translated = postProcessTranslation(raw);
+        if (!translated.trim()) throw new Error('번역 결과가 비어 있어 전송하지 않았습니다.');
+        if (autoSend && (!getSettings().autoTranslateOnSend || KOREAN_INPUT_RE.test(translated) || translated.trimStart().startsWith('/'))) {
+            throw new Error('자동 번역이 꺼졌거나 영문 번역 결과가 안전하지 않아 전송하지 않았습니다.');
+        }
 
         runtime.lastOriginal = source;
         runtime.lastTranslation = translated;
         setInputValue(translated);
         setTranslateButtonState('complete');
+        return translated;
     } catch (error) {
-        if (runtime.currentAbortController?.signal.aborted || error?.name === 'AbortError') {
+        if (controller.signal.aborted || error?.name === 'AbortError') {
             toast('info', '번역을 취소했습니다.');
         } else {
             console.error('[Input Translator] Translation failed:', error);
             toast('error', error?.message || '번역 요청에 실패했습니다.');
         }
         setTranslateButtonState('idle');
+        return null;
     } finally {
         runtime.currentAbortController = null;
     }
+}
+
+async function translateAndSend() {
+    if (runtime.autoSendPending || runtime.currentAbortController || is_send_press) return;
+    const input = getInputElement();
+    const source = String(input?.value ?? '');
+    if (!source.trim() || !KOREAN_INPUT_RE.test(source) || source.trimStart().startsWith('/')) return;
+
+    // Lock before the first await, including the host's asynchronous send path.
+    runtime.autoSendPending = true;
+    const chat = getContext().chat;
+    const chatId = getCurrentChatId();
+    try {
+        const translated = await translateSource(source, { autoSend: true });
+        if (!translated || !getSettings().autoTranslateOnSend || input !== getInputElement() ||
+            input.value !== translated || chat !== getContext().chat || chatId !== getCurrentChatId()) return;
+        // Use the same host function as Enter. No simulated Enter/click and no
+        // bypass flag that could accidentally let a second user send through.
+        await sendTextareaMessage();
+    } catch (error) {
+        console.error('[Input Translator] Auto send failed:', error);
+        toast('error', '번역문 전송을 완료하지 못했습니다. 대화와 입력창을 확인해 주세요.');
+    } finally {
+        runtime.autoSendPending = false;
+    }
+}
+
+function interceptSend(event) {
+    const input = getInputElement();
+    const isKey = event.type === 'keydown';
+    if (isKey) {
+        if (event.target !== input || event.key !== 'Enter' || event.shiftKey || event.altKey || event.metaKey) return;
+        if (!shouldSendOnEnter()) return;
+        // Preserve IME confirmation, but keep the host's Ctrl+Enter handler
+        // from sending unfinished Korean while composition is in progress.
+        if (event.isComposing || event.keyCode === 229) {
+            if (getSettings().autoTranslateOnSend || runtime.currentAbortController) event.stopImmediatePropagation();
+            return;
+        }
+    } else if (!(event.target instanceof Element) || !event.target.closest('#send_but')) {
+        return;
+    }
+    const source = String(input?.value ?? '');
+    const busy = runtime.autoSendPending || runtime.currentAbortController;
+    const shouldTranslate = getSettings().autoTranslateOnSend && KOREAN_INPUT_RE.test(source) && !source.trimStart().startsWith('/');
+    if (!busy && !shouldTranslate) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (!busy && !event.repeat) void translateAndSend();
+}
+
+function updateSendControls() {
+    const settings = getSettings();
+    for (const checkbox of document.querySelectorAll('[data-itr-setting]')) {
+        checkbox.checked = settings[checkbox.dataset.itrSetting];
+    }
+    const button = document.querySelector('#itr_translate_button');
+    button?.classList.toggle('itr-hidden', !settings.showTranslateButton && !runtime.currentAbortController);
+}
+
+function bindSendControls(container) {
+    for (const checkbox of container.querySelectorAll('[data-itr-setting]')) {
+        checkbox.addEventListener('change', () => {
+            const key = checkbox.dataset.itrSetting;
+            getSettings()[key] = checkbox.checked;
+            if (key === 'autoTranslateOnSend' && !checkbox.checked && runtime.autoSendPending) {
+                runtime.currentAbortController?.abort();
+            }
+            if (key === 'showTranslateButton' && !checkbox.checked) closeActionPopover();
+            saveSettings();
+            updateSendControls();
+        });
+    }
+    updateSendControls();
+}
+
+function sendControlsHtml() {
+    return `
+        <label class="checkbox_label"><input type="checkbox" data-itr-setting="autoTranslateOnSend"><span>전송 시 자동 번역</span></label>
+        <small>한글 입력을 Enter 또는 전송 버튼으로 보내면 영어 번역 후 전송합니다. Shift+Enter는 줄바꿈이며, 실패·취소 시 전송하지 않습니다.</small>
+        <label class="checkbox_label"><input type="checkbox" data-itr-setting="showTranslateButton"><span>채팅창 지구본 아이콘 표시</span></label>
+        <small>숨겨도 자동 번역은 사용할 수 있습니다. 번역 중에는 취소 버튼이 잠시 표시됩니다.</small>`;
+}
+
+function installExtensionSettings() {
+    if (document.querySelector('#itr_extension_settings')) return true;
+    const container = document.querySelector('#extensions_settings2') ?? document.querySelector('#extensions_settings');
+    if (!container) return false;
+    const section = document.createElement('div');
+    section.id = 'itr_extension_settings';
+    section.className = 'extension_container';
+    section.innerHTML = `<div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header"><b>알잘딱깔센 · 인풋 번역</b><div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div></div>
+        <div class="inline-drawer-content"><div class="itr-form-stack">${sendControlsHtml()}
+        <button type="button" class="menu_button" id="itr_open_translation_settings">번역 연결 / 설정 열기</button></div></div></div>`;
+    container.appendChild(section);
+    bindSendControls(section);
+    section.querySelector('#itr_open_translation_settings').addEventListener('click', () => openSettings('connection'));
+    return true;
 }
 
 function closeActionPopover() {
@@ -354,6 +486,7 @@ async function onTranslateButtonClick() {
         runtime.currentAbortController.abort();
         return;
     }
+    if (runtime.autoSendPending) return;
 
     const input = getInputElement();
     const source = String(input?.value ?? '');
@@ -393,7 +526,8 @@ function installTranslateButton() {
         }
     });
 
-    sendButton.before(button);
+    (document.querySelector('#rightSendForm') ?? sendButton.parentElement).appendChild(button);
+    updateSendControls();
 
     const input = getInputElement();
     input?.addEventListener('input', () => {
@@ -505,6 +639,7 @@ function renderConnectionTab() {
 
     body.innerHTML = `
         <div class="itr-form-stack">
+            ${sendControlsHtml()}
             <label class="itr-field">
                 <span>Connection Profile</span>
                 <select id="itr_profile_select" class="text_pole"></select>
@@ -518,6 +653,8 @@ function renderConnectionTab() {
                 <small>1턴 = 직전 user + assistant 한 세트. 번역 전 메타 블록은 로컬에서 제거합니다.</small>
             </label>
         </div>`;
+
+    bindSendControls(body);
 
     const select = body.querySelector('#itr_profile_select');
     const placeholder = document.createElement('option');
@@ -822,12 +959,24 @@ function installUiWithRetry() {
         attempts += 1;
         const a = installTranslateButton();
         const b = installWandMenuItem();
-        if ((a && b) || attempts >= 100) clearInterval(timer);
+        const c = installExtensionSettings();
+        if ((a && b && c) || attempts >= 100) clearInterval(timer);
     }, 100);
 }
 
 function init() {
     getSettings();
+    const context = getContext();
+    context.eventSource?.on(context.eventTypes.CHAT_CHANGED, () => {
+        runtime.inputRevision += 1;
+        runtime.currentAbortController?.abort();
+        closeActionPopover();
+    });
+    window.addEventListener('click', interceptSend, true);
+    window.addEventListener('keydown', interceptSend, true);
+    document.addEventListener('input', event => {
+        if (event.target === getInputElement()) runtime.inputRevision += 1;
+    }, true);
     installUiWithRetry();
     window.addEventListener('resize', closeActionPopover);
     window.addEventListener('scroll', closeActionPopover, true);
